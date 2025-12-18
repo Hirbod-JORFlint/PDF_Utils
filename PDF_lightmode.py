@@ -29,6 +29,7 @@ import fitz  # PyMuPDF
 import numpy as np
 from PIL import Image, ImageOps, ImageEnhance
 from tqdm import tqdm
+import cv2
 
 # Configure Logging
 logging.basicConfig(
@@ -232,37 +233,28 @@ class ImageProcessor:
             doc = fitz.open(self.input_path)
             out_pdf = fitz.open()
 
-            logger.info(f"Processing {len(doc)} pages in Enhanced Image Mode...")
+            logger.info(f"Processing in High-Contrast Image Mode...")
 
             for page in tqdm(doc, desc="Image Conversion"):
-                images_on_page = page.get_images(full=True)
-                
-                # Render page at high DPI to preserve font detail
                 pix = page.get_pixmap(dpi=self.dpi)
-                mode = "RGBA" if pix.alpha else "RGB"
-                img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-                # 1. Process with Adaptive Thresholding
+                # 1. Process with Local Contrast Awareness
                 processed_base = self._process_image_content(img)
 
-                # 2. Smart Paste for Images/Diagrams
-                for item in images_on_page:
+                # 2. Paste original images back (Heuristic preservation)
+                for item in page.get_images(full=True):
                     rect = page.get_image_bbox(item)
                     if not rect.is_infinite and not rect.is_empty:
                         sx, sy = pix.width / page.rect.width, pix.height / page.rect.height
-                        crop_box = (
-                            max(0, int(rect.x0 * sx)), max(0, int(rect.y0 * sy)),
-                            min(pix.width, int(rect.x1 * sx)), min(pix.height, int(rect.y1 * sy))
-                        )
-                        
+                        crop_box = (max(0, int(rect.x0 * sx)), max(0, int(rect.y0 * sy)),
+                                   min(pix.width, int(rect.x1 * sx)), min(pix.height, int(rect.y1 * sy)))
                         if crop_box[2] > crop_box[0] and crop_box[3] > crop_box[1]:
-                            original_patch = img.crop(crop_box)
-                            # Lighten and de-saturate background images slightly for "Paper" feel
-                            processed_base.paste(original_patch, crop_box)
+                            processed_base.paste(img.crop(crop_box), crop_box)
 
-                # 3. Save page
+                # 3. Build Output
                 with io.BytesIO() as bio:
-                    processed_base.save(bio, format="JPEG", quality=90)
+                    processed_base.save(bio, format="JPEG", quality=95)
                     new_page = out_pdf.new_page(width=page.rect.width, height=page.rect.height)
                     new_page.insert_image(page.rect, stream=bio.getvalue())
 
@@ -275,37 +267,38 @@ class ImageProcessor:
 
     def _process_image_content(self, img: Image.Image) -> Image.Image:
         """
-        Uses adaptive processing to preserve thin fonts and varied titles.
+        Uses Local Adaptive Thresholding to capture colored titles 
+        that a global threshold misses.
         """
-        # Convert to Grayscale
-        gray = img.convert("L")
-        np_gray = np.array(gray)
+        # Convert PIL to OpenCV format
+        open_cv_image = np.array(img.convert('L')) 
 
-        # 1. Contrast Enhancement (Pre-threshold)
-        # This helps make faint titles stand out from the dark background
-        enhanced_gray = ImageOps.autocontrast(gray, cutoff=2)
-        np_gray = np.array(enhanced_gray)
+        # 1. Histogram Equalization: Forces titles to pop against dark backgrounds
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        contrast_enhanced = clahe.apply(open_cv_image)
 
-        # 2. Adaptive Masking
-        # Instead of one global threshold, we use the user threshold as a baseline
-        # but apply a small "dilation" to the mask to thicken thin font strokes.
-        from scipy.ndimage import binary_dilation
-        
-        mask = np_gray > self.threshold
-        
-        # Thicken the text mask slightly (1px) so thin titles don't vanish
-        # This acts like a "Bold" filter for visibility
-        mask = binary_dilation(mask, iterations=1)
+        # 2. Adaptive Thresholding: Finds text based on local neighbors (block size 15)
+        # This is the key to finding colored titles that aren't pure white.
+        mask = cv2.adaptiveThreshold(
+            contrast_enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 15, -10
+        )
 
-        # 3. Apply Theme Colors
-        h, w = np_gray.shape
+        # 3. Noise reduction (Denoising small specs while keeping text)
+        kernel = np.ones((2,2), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        # 4. Map back to Theme
+        h, w = open_cv_image.shape
         result = np.zeros((h, w, 3), dtype=np.uint8)
         
         fg = np.array(self.theme.fg_uint8, dtype=np.uint8)
         bg = np.array(self.theme.bg_uint8, dtype=np.uint8)
 
-        result[mask] = fg
-        result[~mask] = bg
+        # In Adaptive Threshold, text is white (255)
+        text_indices = mask == 255
+        result[text_indices] = fg
+        result[~text_indices] = bg
 
         return Image.fromarray(result)
 
