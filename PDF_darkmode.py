@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-PDF Dark Mode Converter (v5.0 - Professional Grade)
-==================================================
+PDF Dark Mode Converter (v6.0 - Font-Preservation Focus)
+======================================================
 
 An expert-grade utility for converting PDFs to dark mode while maximizing
-the preservation of original fonts, styles, and embedded visual assets.
+the preservation of original styles, specifically bold and italic variants.
 
-Optimizations:
-- Vector Mode: Utilizes PyMuPDF's low-level font name mapping and block 
-  extraction to maintain precise spacing, weight, and slant.
-- Style Logic: Uses a luminance-based 'Selective Color Preservation' algorithm.
-  Standard text is darkened, while syntax highlighting, links, and intentional 
-  colored branding are preserved in their original state.
-- Image Mode: Stencils original images back into the dark-mode layout at 
-  pixel-perfect coordinates to prevent degradation.
+Core Optimizations for Font Preservation:
+- Binary Flag Extraction: Analyzes the font descriptor flags to detect 
+  Bold, Italic, and Monospaced properties even when font names are obfuscated.
+- Exact Metadata Passthrough: Uses 'dict' extraction to capture 'flags', 
+  'font', 'size', and 'color' for every text span.
+- Font Synthesis: If the original font is not available, the script 
+  synthesizes the style using the extracted binary attributes to ensure 
+  the visual weight and slant are maintained.
+- Selective Recoloring: Preserves non-black text (e.g., links, colored headers)
+  to keep the original document's semantic styling.
 
 Dependencies:
     pip install pymupdf pillow numpy tqdm
@@ -47,7 +49,7 @@ THEMES = {
 }
 
 # ==============================================================================
-# Logic & Helpers
+# Style & Color Analytics
 # ==============================================================================
 
 def get_rgb_normalized(color_int: int) -> Tuple[float, float, float]:
@@ -60,135 +62,139 @@ def get_rgb_normalized(color_int: int) -> Tuple[float, float, float]:
     )
 
 def is_standard_text_color(rgb: Tuple[float, float, float], threshold: float = 0.3) -> bool:
-    """
-    Determines if a color is 'standard reading text' (usually black/gray).
-    Returns True if it should be swapped for the theme's foreground color.
-    """
-    # Relative luminance formula
+    """Detects if a color is standard black/dark text meant for darkening."""
     luminance = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
     return luminance < threshold
 
-def enhance_raster_image(pil_img: Image.Image) -> Image.Image:
-    """Subtly dims images for better integration with dark themes."""
-    return ImageEnhance.Brightness(pil_img).enhance(0.85)
+def get_font_style(flags: int) -> str:
+    """
+    Decodes PyMuPDF font flags to reconstruct style.
+    Bit 0: Superscript, Bit 1: Italic, Bit 2: Serifed, Bit 3: Monospaced, Bit 4: Bold
+    """
+    style = ""
+    # PyMuPDF font names usually follow 'helv', 'tiro', 'cour' bases
+    # If the original font name isn't working, we use these constants + style chars
+    is_italic = flags & 2  # Bit 1
+    is_bold = flags & 16   # Bit 4
+    
+    if is_bold and is_italic:
+        style = "bi"
+    elif is_bold:
+        style = "b"
+    elif is_italic:
+        style = "i"
+    return style
 
 # ==============================================================================
-# Vector Mode (Style Preservation Focus)
+# Vector Mode (Ultra-Fidelity Font Handling)
 # ==============================================================================
 
 def run_vector_mode(doc_in: fitz.Document, doc_out: fitz.Document, theme: Theme):
     """
-    Redraws PDF elements by extracting exact font-metadata.
-    Uses 'dict' extraction to access spans containing font names and sizes.
+    Reconstructs the PDF while preserving Font Weight, Slant, and Color accents.
     """
     bg_norm = [c/255.0 for c in theme.bg_color]
     fg_norm = [c/255.0 for c in theme.fg_color]
 
-    for page in tqdm(doc_in, desc="Processing (Vector)", unit="page"):
+    for page in tqdm(doc_in, desc="Processing (Vector Mode)", unit="page"):
         new_page = doc_out.new_page(width=page.rect.width, height=page.rect.height)
         
-        # 1. Fill Page Background
+        # 1. Background
         shape = new_page.new_shape()
         shape.draw_rect(new_page.rect)
         shape.finish(color=bg_norm, fill=bg_norm)
         shape.commit()
 
-        # 2. Extract and Re-insert Original Images (Bit-for-Bit)
-        # This keeps photos/logos looking sharp and untinted.
+        # 2. Image Preservation
         for img_info in page.get_image_info(xrefs=True):
             try:
                 xref = img_info['xref']
                 if xref == 0: continue
                 pix = fitz.Pixmap(doc_in, xref)
-                # Convert to RGB if it's CMYK or DeviceGray
                 if pix.n - pix.alpha > 3:
                     pix = fitz.Pixmap(fitz.csRGB, pix)
                 new_page.insert_image(img_info['bbox'], stream=pix.tobytes())
-            except:
-                continue
+            except: continue
 
-        # 3. High-Fidelity Text Reconstruction
-        # Flags preserve spacing, ligatures, and specific glyph positioning
+        # 3. High-Fidelity Text Extraction
+        # dict extraction is essential for capturing font flags (bold/italic)
         page_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE)
         
         for block in page_dict.get("blocks", []):
-            if block["type"] == 0:  # Text block
+            if block["type"] == 0:
                 for line in block["lines"]:
                     for span in line["spans"]:
-                        # Extract original color and determine if it's "intended" or "default"
                         orig_rgb = get_rgb_normalized(span["color"])
-                        final_text_color = fg_norm if is_standard_text_color(orig_rgb) else orig_rgb
+                        final_color = fg_norm if is_standard_text_color(orig_rgb) else orig_rgb
+                        
+                        # Style reconstruction
+                        font_name = span["font"]
+                        font_flags = span["flags"]
+                        style_suffix = get_font_style(font_flags)
                         
                         try:
-                            # We provide the original font name. PyMuPDF attempts 
-                            # to match this to system fonts or standard replacements.
+                            # We attempt to insert text using the original font name.
+                            # PyMuPDF is excellent at matching 'Helvetica-Bold' or 'TimesNewRoman,BoldItalic'
                             new_page.insert_text(
                                 span["origin"],
                                 span["text"],
                                 fontsize=span["size"],
-                                fontname=span["font"],
-                                color=final_text_color,
-                                morph=None  # Preserves any rotation/scaling in original layout
+                                fontname=font_name,
+                                color=final_color,
+                                morph=None
                             )
                         except:
-                            # Minimal fallback if font mapping fails
+                            # If the specific font name fails, use a base font + reconstructed style
+                            base_font = "helv" # Default sans
+                            if font_flags & 4: base_font = "tiro" # Serif
+                            if font_flags & 8: base_font = "cour" # Mono
+                            
                             new_page.insert_text(
                                 span["origin"], 
                                 span["text"], 
                                 fontsize=span["size"], 
-                                color=final_text_color
+                                fontname=f"{base_font}{style_suffix}", 
+                                color=final_color
                             )
 
 # ==============================================================================
-# Image Mode (Robustness Focus)
+# Image Mode (Robust Rasterization)
 # ==============================================================================
 
 def run_image_mode(doc_in: fitz.Document, doc_out: fitz.Document, theme: Theme, args):
-    """
-    Rasterizes the page to a high-res image and applies an inverse-luminance mask.
-    Prevents image corruption by 'punching out' image bounding boxes.
-    """
+    """Raster-based processing with original image stenciling."""
     theme_bg = np.array(theme.bg_color, dtype=np.uint8)
     theme_fg = np.array(theme.fg_color, dtype=np.uint8)
 
-    for page in tqdm(doc_in, desc="Processing (Image)", unit="page"):
+    for page in tqdm(doc_in, desc="Processing (Image Mode)", unit="page"):
         pix = page.get_pixmap(dpi=args.dpi)
         img_orig = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         
-        # 1. Mask Generation
-        # Convert to L (luminance), invert so text pixels are high value (255)
         gray = ImageOps.invert(img_orig.convert("L"))
         mask = gray.point(lambda p: 255 if p > args.threshold else 0)
-        if args.blur > 0:
-            mask = mask.filter(ImageFilter.GaussianBlur(args.blur))
+        if args.blur > 0: mask = mask.filter(ImageFilter.GaussianBlur(args.blur))
         
-        # Prepare for compositing (numpy)
         m_arr = np.array(mask).astype(float) / 255.0
         m_arr = np.expand_dims(m_arr, axis=2)
         
-        # 2. Composition
         canvas_bg = np.full_like(np.array(img_orig), theme_bg)
         canvas_fg = np.full_like(np.array(img_orig), theme_fg)
         
-        dark_mode_layer = (canvas_fg * m_arr + canvas_bg * (1.0 - m_arr)).astype(np.uint8)
-        final_pil = Image.fromarray(dark_mode_layer)
+        processed_img = Image.fromarray((canvas_fg * m_arr + canvas_bg * (1.0 - m_arr)).astype(np.uint8))
 
-        # 3. Patch Original Images back in (Prevents image darkening/corruption)
+        # Restore images onto the dark background
         scale = args.dpi / 72.0
         for info in page.get_image_info():
             b = [int(v * scale) for v in info['bbox']]
-            # Boundaries check
-            x0, y0 = max(0, b[0]), max(0, b[1])
-            x1, y1 = min(img_orig.width, b[2]), min(img_orig.height, b[3])
-            
-            if x1 > x0 and y1 > y0:
-                crop = img_orig.crop((x0, y0, x1, y1))
-                final_pil.paste(enhance_raster_image(crop), (x0, y0))
+            if b[2] > b[0] and b[3] > b[1]:
+                crop = img_orig.crop((max(0, b[0]), max(0, b[1]), min(img_orig.width, b[2]), min(img_orig.height, b[3])))
+                # Dim slightly for aesthetics
+                crop = ImageEnhance.Brightness(crop).enhance(0.85)
+                processed_img.paste(crop, (b[0], b[1]))
 
-        # 4. Save back to output PDF
         out_page = doc_out.new_page(width=page.rect.width, height=page.rect.height)
         buf = io.BytesIO()
-        final_pil.save(buf, format="JPEG", quality=85)
+        processed_img.save(buf, format="JPEG", quality=85)
         out_page.insert_image(out_page.rect, stream=buf.getvalue())
 
 # ==============================================================================
@@ -196,38 +202,35 @@ def run_image_mode(doc_in: fitz.Document, doc_out: fitz.Document, theme: Theme, 
 # ==============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Professional PDF Dark Mode Converter v5.0")
-    parser.add_argument("input", help="Input PDF file path")
-    parser.add_argument("output", help="Output PDF file path")
-    parser.add_argument("--theme", choices=THEMES.keys(), default="amoled", help="The color theme to use")
-    parser.add_argument("--mode", choices=["image", "vector"], default="vector", 
-                        help="Processing mode: vector (selectable text, high-fidelity) or image (robust, raster)")
-    parser.add_argument("--dpi", type=int, default=150, help="DPI for image mode (higher = sharper but slower)")
-    parser.add_argument("--threshold", type=int, default=128, help="Luminance threshold for text detection (0-255)")
-    parser.add_argument("--blur", type=float, default=0.5, help="Blur radius for text mask smoothing")
+    parser = argparse.ArgumentParser(description="PDF Dark Mode Converter v6.0")
+    parser.add_argument("input", help="Input PDF path")
+    parser.add_argument("output", help="Output PDF path")
+    parser.add_argument("--theme", choices=THEMES.keys(), default="amoled")
+    parser.add_argument("--mode", choices=["image", "vector"], default="vector")
+    parser.add_argument("--dpi", type=int, default=150)
+    parser.add_argument("--threshold", type=int, default=128)
+    parser.add_argument("--blur", type=float, default=0.5)
 
     args = parser.parse_args()
     
     try:
         doc_in = fitz.open(args.input)
         doc_out = fitz.open()
-        selected_theme = THEMES[args.theme]
+        theme = THEMES[args.theme]
         
-        print(f"[*] Converter v5.0 | Source: {args.input}")
-        print(f"[*] Target: {args.output} | Mode: {args.mode.upper()}")
-        print(f"[*] Theme: {selected_theme.name} - {selected_theme.desc}")
+        print(f"[*] Starting Conversion: {args.input}")
+        print(f"[*] Mode: {args.mode.upper()} | Theme: {theme.name}")
 
         if args.mode == "vector":
-            run_vector_mode(doc_in, doc_out, selected_theme)
+            run_vector_mode(doc_in, doc_out, theme)
         else:
-            run_image_mode(doc_in, doc_out, selected_theme, args)
+            run_image_mode(doc_in, doc_out, theme, args)
             
-        # Compress the output to keep file size reasonable
         doc_out.save(args.output, deflate=True, garbage=4)
-        print(f"\n[+] Processing complete. File saved to: {args.output}")
+        print(f"\n[+] Success! File saved to: {args.output}")
 
     except Exception as e:
-        print(f"\n[!] Error during execution: {e}")
+        print(f"\n[!] Error: {e}")
         sys.exit(1)
     finally:
         if 'doc_in' in locals(): doc_in.close()
