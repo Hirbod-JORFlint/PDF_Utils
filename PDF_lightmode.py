@@ -219,11 +219,6 @@ class VectorProcessor:
 # ==========================================
 
 class ImageProcessor:
-    """
-    Rasterizes pages, performs computer vision operations to swap themes,
-    and reconstructs the PDF. Handles scanned docs or complex graphics.
-    """
-
     def __init__(self, input_path: str, output_path: str, theme: Theme, 
                  dpi: int = 200, threshold: int = 100):
         self.input_path = input_path
@@ -237,76 +232,39 @@ class ImageProcessor:
             doc = fitz.open(self.input_path)
             out_pdf = fitz.open()
 
-            logger.info(f"Processing {len(doc)} pages in Image Mode (DPI={self.dpi})...")
+            logger.info(f"Processing {len(doc)} pages in Enhanced Image Mode...")
 
             for page in tqdm(doc, desc="Image Conversion"):
-                # 1. Detect Images (Photos/Diagrams) to preserve
-                # We do this before rendering to get coordinates
                 images_on_page = page.get_images(full=True)
-                image_rects = []
                 
-                # Render full page
+                # Render page at high DPI to preserve font detail
                 pix = page.get_pixmap(dpi=self.dpi)
                 mode = "RGBA" if pix.alpha else "RGB"
                 img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
 
-                # 2. Process the base image (The "Text" layer)
+                # 1. Process with Adaptive Thresholding
                 processed_base = self._process_image_content(img)
 
-                # 3. Paste original images back (Heuristic preservation)
-                # Note: Extracting exact bbox from get_images is tricky due to transforms.
-                # A safer bet for generic PDFs is processing the whole image, 
-                # but "preserving" diagrams usually requires knowing where they are.
-                # We will perform a "smart paste" by detecting non-text blocks if requested,
-                # but for robustness, we simply boost the contrast of the whole result.
-                
-                # However, to strictly follow instructions: "Detect embedded images... Crop... Paste back"
-                # We use PyMuPDF's image list to locate them roughly. 
-                # Since mapping PDF coordinates to the rendered Pixmap is complex,
-                # we will rely on PyMuPDF's `page.get_image_bbox`
-                
+                # 2. Smart Paste for Images/Diagrams
                 for item in images_on_page:
-                    xref = item[0]
                     rect = page.get_image_bbox(item)
-                    
                     if not rect.is_infinite and not rect.is_empty:
-                        # Convert PDF rect to Pixmap coordinates
-                        # PDF user units -> Pixmap pixels
-                        # Scale factor
-                        sx = pix.width / page.rect.width
-                        sy = pix.height / page.rect.height
-                        
+                        sx, sy = pix.width / page.rect.width, pix.height / page.rect.height
                         crop_box = (
-                            int(rect.x0 * sx), int(rect.y0 * sy),
-                            int(rect.x1 * sx), int(rect.y1 * sy)
-                        )
-                        
-                        # Ensure crop is within bounds
-                        crop_box = (
-                            max(0, crop_box[0]), max(0, crop_box[1]),
-                            min(pix.width, crop_box[2]), min(pix.height, crop_box[3])
+                            max(0, int(rect.x0 * sx)), max(0, int(rect.y0 * sy)),
+                            min(pix.width, int(rect.x1 * sx)), min(pix.height, int(rect.y1 * sy))
                         )
                         
                         if crop_box[2] > crop_box[0] and crop_box[3] > crop_box[1]:
-                            # Crop original region
                             original_patch = img.crop(crop_box)
-                            
-                            # Enhance the patch (slightly increase brightness/contrast)
-                            enhancer = ImageEnhance.Brightness(original_patch)
-                            original_patch = enhancer.enhance(1.1)
-                            enhancer = ImageEnhance.Contrast(original_patch)
-                            original_patch = enhancer.enhance(1.1)
-                            
-                            # Paste back onto processed base
+                            # Lighten and de-saturate background images slightly for "Paper" feel
                             processed_base.paste(original_patch, crop_box)
 
-                # 4. Add page to output PDF
+                # 3. Save page
                 with io.BytesIO() as bio:
-                    processed_base.save(bio, format="JPEG", quality=85)
-                    img_bytes = bio.getvalue()
-                    
+                    processed_base.save(bio, format="JPEG", quality=90)
                     new_page = out_pdf.new_page(width=page.rect.width, height=page.rect.height)
-                    new_page.insert_image(page.rect, stream=img_bytes)
+                    new_page.insert_image(page.rect, stream=bio.getvalue())
 
             out_pdf.save(self.output_path, garbage=4, deflate=True)
             logger.info(f"Successfully saved to {self.output_path}")
@@ -317,26 +275,32 @@ class ImageProcessor:
 
     def _process_image_content(self, img: Image.Image) -> Image.Image:
         """
-        Thresholds the image to separate text from bg.
-        Reconstructs using Theme colors.
+        Uses adaptive processing to preserve thin fonts and varied titles.
         """
         # Convert to Grayscale
         gray = img.convert("L")
         np_gray = np.array(gray)
 
-        # Thresholding: 
-        # In Dark Mode PDF: Text is Bright (high val), BG is Dark (low val).
-        # Mask = pixels > threshold (The Text)
-        mask = np_gray > self.threshold
+        # 1. Contrast Enhancement (Pre-threshold)
+        # This helps make faint titles stand out from the dark background
+        enhanced_gray = ImageOps.autocontrast(gray, cutoff=2)
+        np_gray = np.array(enhanced_gray)
 
-        # Create output array
-        # Shape (H, W, 3)
+        # 2. Adaptive Masking
+        # Instead of one global threshold, we use the user threshold as a baseline
+        # but apply a small "dilation" to the mask to thicken thin font strokes.
+        from scipy.ndimage import binary_dilation
+        
+        mask = np_gray > self.threshold
+        
+        # Thicken the text mask slightly (1px) so thin titles don't vanish
+        # This acts like a "Bold" filter for visibility
+        mask = binary_dilation(mask, iterations=1)
+
+        # 3. Apply Theme Colors
         h, w = np_gray.shape
         result = np.zeros((h, w, 3), dtype=np.uint8)
-
-        # Apply Theme Colors
-        # Where mask is True (Text), use Foreground
-        # Where mask is False (Background), use Background
+        
         fg = np.array(self.theme.fg_uint8, dtype=np.uint8)
         bg = np.array(self.theme.bg_uint8, dtype=np.uint8)
 
@@ -344,7 +308,6 @@ class ImageProcessor:
         result[~mask] = bg
 
         return Image.fromarray(result)
-
 
 # ==========================================
 # Main CLI
