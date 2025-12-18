@@ -1,233 +1,400 @@
 #!/usr/bin/env python3
 """
-PDF Light Mode Converter (Hardened Vector Edition)
+PDF Light Mode Converter
+------------------------
+A professional-grade tool to convert dark-themed PDFs into clean, printable 
+light-themed documents.
 
-WHY THE PREVIOUS VERSION FAILED ON SOME PDFs
---------------------------------------------
-Some dark-themed PDFs do NOT use simple rg/RG/g/G/k/K operators.
-Common problematic patterns:
+Modes:
+1. Vector-Native (Default): Modifies PDF content streams directly. Preserves 
+   text selection, vector fidelity, and file size.
+2. Image-Based: Rasterizes pages, processes contrast, and rebuilds the PDF. 
+   Used for scanned docs or complex renderings.
 
-1. Colors set via:
-   - sc / SC (device-dependent color, active colorspace)
-   - scn / SCN (patterns, spot colors)
-   - cs / CS (colorspace switches)
-
-2. Backgrounds painted *after* text (z-order issue)
-3. Very dark gray backgrounds (not pure black)
-4. Text painted using fill color inherited from an ExtGState
-
-This revision fixes the *most common real-world failure mode*, but some PDFs still fail because:
-
-• Text is painted with *black fill* on *black background shapes*
-• Background shapes are vector paths filled with dark colors
-• Simply recoloring text does nothing because it is already black
-
-NEW STRATEGY ADDED BELOW:
--------------------------
-We now **detect and neutralize large dark filled rectangles** (likely page backgrounds)
-before text is rendered.
-
-Heuristic:
-- Any filled rectangle/path covering >80% of page area
-- With luminance < 0.4
-→ treated as background and recolored to theme.bg_color
-
-This prevents black-on-black text invisibility without touching fonts.
-
+Usage:
+    python pdf_light_mode.py input.pdf output.pdf --mode vector --theme paper
 """
 
-from __future__ import annotations
-
 import argparse
-import io
-import logging
-import re
 import sys
+import logging
+import io
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, List, Union, Optional
+from pathlib import Path
 
+# Third-party libraries
+import pikepdf
+import fitz  # PyMuPDF
+import numpy as np
+from PIL import Image, ImageOps, ImageEnhance
 from tqdm import tqdm
 
-# ----------------------------- Theme --------------------------------------
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# Domain Logic: Themes & Color Math
+# ==========================================
 
 @dataclass
 class Theme:
     name: str
+    # Colors are normalized (0.0 - 1.0)
     bg_color: Tuple[float, float, float]
     fg_color: Tuple[float, float, float]
+
+    @property
+    def bg_uint8(self) -> Tuple[int, int, int]:
+        return tuple(int(c * 255) for c in self.bg_color)
+
+    @property
+    def fg_uint8(self) -> Tuple[int, int, int]:
+        return tuple(int(c * 255) for c in self.fg_color)
 
 
 THEMES = {
     "paper": Theme("Paper", (1.0, 1.0, 1.0), (0.0, 0.0, 0.0)),
-    "warm_white": Theme("Warm White", (0.992, 0.973, 0.925), (0.06, 0.06, 0.06)),
-    "soft_gray": Theme("Soft Gray", (0.96, 0.96, 0.97), (0.08, 0.08, 0.08)),
+    "warm": Theme("Warm White", (0.98, 0.96, 0.93), (0.1, 0.1, 0.1)),
+    "soft": Theme("Soft Gray", (0.95, 0.95, 0.95), (0.15, 0.15, 0.15)),
 }
 
-# ----------------------------- Utilities ----------------------------------
 
-def clamp01(v: float) -> float:
-    return max(0.0, min(1.0, v))
+class ColorUtils:
+    """Helper methods for PDF color space conversions and luminance logic."""
 
+    @staticmethod
+    def get_luminance(r: float, g: float, b: float) -> float:
+        """Calculates perceptual luminance (Rec. 709)."""
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
-def luminance(rgb):
-    r, g, b = rgb
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    @staticmethod
+    def cmyk_to_rgb(c: float, m: float, y: float, k: float) -> Tuple[float, float, float]:
+        """Simple CMYK to RGB conversion."""
+        r = (1.0 - c) * (1.0 - k)
+        g = (1.0 - m) * (1.0 - k)
+        b = (1.0 - y) * (1.0 - k)
+        return r, g, b
 
-
-def cmyk_to_rgb(c, m, y, k):
-    return (
-        1.0 - min(1.0, c + k),
-        1.0 - min(1.0, m + k),
-        1.0 - min(1.0, y + k),
-    )
-
-
-NUM = r"[+-]?(?:\d*\.\d+|\d+)(?:[eE][+-]?\d+)?"
-
-# Color operators
-RE_RGB = re.compile(rf"({NUM})\s+({NUM})\s+({NUM})\s+rg\b")
-RE_RGB_S = re.compile(rf"({NUM})\s+({NUM})\s+({NUM})\s+RG\b")
-RE_G = re.compile(rf"({NUM})\s+g\b")
-RE_G_S = re.compile(rf"({NUM})\s+G\b")
-RE_CMYK = re.compile(rf"({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s+k\b")
-RE_CMYK_S = re.compile(rf"({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s+K\b")
-RE_SC = re.compile(rf"({NUM})\s+({NUM})\s+({NUM})\s+sc\b")
-RE_SC_S = re.compile(rf"({NUM})\s+({NUM})\s+({NUM})\s+SC\b")
-
-# Text blocks
-RE_BT = re.compile(r"\bBT\b")
+    @staticmethod
+    def normalize_args(args: List) -> List[float]:
+        """
+        Converts PikePDF arguments to standard python floats.
+        Handles integers, floats, and pikepdf numeric objects.
+        """
+        return [float(x) for x in args]
 
 
-# ----------------------------- Vector Mode --------------------------------
+# ==========================================
+# Processor 1: Vector-Native (PikePDF)
+# ==========================================
 
-def vector_mode(input_pdf: str, output_pdf: str, theme: Theme) -> None:
-    import pikepdf
+class VectorProcessor:
+    def __init__(self, input_path: str, output_path: str, theme: Theme):
+        self.input_path = input_path
+        self.output_path = output_path
+        self.theme = theme
+        self.color_ops = {'g', 'G', 'rg', 'RG', 'k', 'K'}
 
-    pdf = pikepdf.Pdf.open(input_pdf)
-
-    for page in tqdm(pdf.pages, desc="Vector pages"):
-        # ---- Read ALL content streams ----
-        data = b""
-        contents = page.obj.get("/Contents")
-        if isinstance(contents, pikepdf.Stream):
-            data = contents.read_bytes()
-        elif contents is not None:
-            for s in contents:
-                if isinstance(s, pikepdf.Stream):
-                    data += s.read_bytes()
-
-        text = data.decode("latin-1")
-
-        # ---- Page size ----
+    def process(self):
         try:
-            llx, lly, urx, ury = map(float, page.MediaBox)
-            w, h = urx - llx, ury - lly
+            with pikepdf.Pdf.open(self.input_path) as pdf:
+                logger.info("Scanning for XObjects and Page streams...")
+                
+                # 1. Iterate over all indirect objects to find Form XObjects
+                # Fix: pdf.objects is a sequence, not a dict
+                for obj in tqdm(pdf.objects, desc="Processing XObjects"):
+                    if isinstance(obj, pikepdf.Stream):
+                        # Safely check types without triggering exceptions on non-dict streams
+                        try:
+                            if obj.get('/Type') == '/XObject' and obj.get('/Subtype') == '/Form':
+                                self._rewrite_stream(obj, pdf, is_page=False)
+                        except (AttributeError, KeyError):
+                            continue
+
+                # 2. Process Page Streams
+                for page in tqdm(pdf.pages, desc="Processing Pages"):
+                    self._rewrite_stream(page, pdf, is_page=True)
+
+                # Save with compression and object stream generation
+                pdf.save(self.output_path, compress_streams=True, 
+                         object_stream_mode=pikepdf.ObjectStreamMode.generate)
+                
+            logger.info(f"Successfully saved to {self.output_path}")
+        except Exception as e:
+            logger.error(f"Vector processing failed: {e}")
+            raise
+
+    def _rewrite_stream(self, target, pdf, is_page=True):
+        """
+        Universal stream rewriter.
+        target: pikepdf.Page (if is_page) or pikepdf.Stream (if XObject)
+        """
+        try:
+            # parse_content_stream works on both Page and Stream objects
+            commands = pikepdf.parse_content_stream(target)
         except Exception:
-            w, h = 595.0, 842.0
+            return 
 
-        # ---- Background ----
-        br, bg, bb = theme.bg_color
-        bg_block = (
-            "q\n"
-            f"{br:.6f} {bg:.6f} {bb:.6f} rg\n"
-            f"0 0 {w:.4f} {h:.4f} re f\n"
-            "Q\n"
-        )
+        new_commands = []
+        
+        # Determine boundaries for Background Neutralization
+        # Pages use MediaBox; XObjects use BBox
+        bbox_obj = target.get('/MediaBox') if is_page else target.get('/BBox')
+        
+        if bbox_obj:
+            m = [float(x) for x in bbox_obj]
+            w, h = m[2] - m[0], m[3] - m[1]
+            area_threshold = (w * h) * 0.8
+        else:
+            m, area_threshold = None, 0
 
-        # ---- Color mapping ----
-        def map_rgb(r, g, b):
-            return theme.fg_color if luminance((r, g, b)) > 0.5 else theme.bg_color
+        # Prepend a full-page theme background for Page objects
+        if is_page and m:
+            new_commands.append(([], pikepdf.Operator("q")))
+            new_commands.append((list(self.theme.bg_color), pikepdf.Operator("rg")))
+            new_commands.append(([m[0], m[1], m[2], m[3]], pikepdf.Operator("re")))
+            new_commands.append(([], pikepdf.Operator("f")))
+            new_commands.append(([], pikepdf.Operator("Q")))
 
-        # ---- Replace ALL color operators ----
-        text = RE_RGB_S.sub(lambda m: f"{' '.join(f'{c:.6f}' for c in map_rgb(*map(float,m.groups())))} RG", text)
-        text = RE_RGB.sub(lambda m: f"{' '.join(f'{c:.6f}' for c in map_rgb(*map(float,m.groups())))} rg", text)
-        text = RE_G_S.sub(lambda m: f"{' '.join(f'{c:.6f}' for c in map_rgb(*([float(m.group(1))]*3)))} RG", text)
-        text = RE_G.sub(lambda m: f"{' '.join(f'{c:.6f}' for c in map_rgb(*([float(m.group(1))]*3)))} rg", text)
-        text = RE_CMYK_S.sub(lambda m: f"{' '.join(f'{c:.6f}' for c in map_rgb(*cmyk_to_rgb(*map(float,m.groups()))))} RG", text)
-        text = RE_CMYK.sub(lambda m: f"{' '.join(f'{c:.6f}' for c in map_rgb(*cmyk_to_rgb(*map(float,m.groups()))))} rg", text)
-        text = RE_SC_S.sub(lambda m: f"{' '.join(f'{c:.6f}' for c in map_rgb(*map(float,m.groups())))} SC", text)
-        text = RE_SC.sub(lambda m: f"{' '.join(f'{c:.6f}' for c in map_rgb(*map(float,m.groups())))} sc", text)
+        current_fill_color = (0.0, 0.0, 0.0)
 
-        # ---- FORCE text foreground at every BT ----
-        fr, fg, fb = theme.fg_color
-        text = RE_BT.sub(f"BT\n{fr:.6f} {fg:.6f} {fb:.6f} rg", text)
+        for operands, operator in commands:
+            op_str = str(operator)
+            
+            if op_str in self.color_ops:
+                clean_ops = ColorUtils.normalize_args(operands)
+                transformed = self._transform_color(clean_ops, op_str)
+                # Keep track of fill color for rectangle neutralization
+                if op_str in ['g', 'rg', 'k']:
+                    current_fill_color = self._get_rgb_approx(clean_ops, op_str)
+                new_commands.append((transformed, operator))
+            
+            # Neutralize large dark rectangles
+            elif op_str == 're' and area_threshold > 0:
+                ops = ColorUtils.normalize_args(operands)
+                if (ops[2] * ops[3]) > area_threshold:
+                    lum = ColorUtils.get_luminance(*current_fill_color)
+                    if lum < 0.5: # If it's a large dark background shape
+                        new_commands.append((list(self.theme.bg_color), pikepdf.Operator("rg")))
+                new_commands.append((operands, operator))
+            else:
+                new_commands.append((operands, operator))
 
-        # ---- Write single normalized stream ----
-        page.obj["/Contents"] = pdf.make_stream((bg_block + text).encode("latin-1"))
+        # Write data back to the correct location
+        new_data = pikepdf.unparse_content_stream(new_commands)
+        if is_page:
+            target.Contents = pdf.make_stream(new_data)
+        else:
+            # For XObjects, we write directly to the stream object
+            target.write(new_data)
 
-    # pikepdf save() options vary by version
-    try:
-        pdf.save(output_pdf, optimize_streams=True, garbage_collect=True)
-    except TypeError:
+    def _get_rgb_approx(self, ops, op):
+        """Internal helper to track the current fill color for the Neutralizer."""
+        if op == 'g': return (ops[0], ops[0], ops[0])
+        if op == 'rg': return (ops[0], ops[1], ops[2])
+        if op == 'k': return ColorUtils.cmyk_to_rgb(*ops)
+        return (0, 0, 0)
+
+    def _transform_color(self, operands, operator):
+        # Maps color to theme based on luminance
+        r, g, b = self._get_rgb_approx(operands, operator)
+        lum = ColorUtils.get_luminance(r, g, b)
+        
+        target = list(self.theme.fg_color) if lum > 0.5 else list(self.theme.bg_color)
+
+        if operator in ['g', 'G']: return [ColorUtils.get_luminance(*target)]
+        if operator in ['rg', 'RG']: return target
+        if operator in ['k', 'K']: 
+            # Simplified CMYK mapping
+            return [0, 0, 0, 1] if lum > 0.5 else [0, 0, 0, 0]
+        return operands
+
+
+# ==========================================
+# Processor 2: Image-Based Fallback (PyMuPDF)
+# ==========================================
+
+class ImageProcessor:
+    """
+    Rasterizes pages, performs computer vision operations to swap themes,
+    and reconstructs the PDF. Handles scanned docs or complex graphics.
+    """
+
+    def __init__(self, input_path: str, output_path: str, theme: Theme, 
+                 dpi: int = 200, threshold: int = 100):
+        self.input_path = input_path
+        self.output_path = output_path
+        self.theme = theme
+        self.dpi = dpi
+        self.threshold = threshold
+
+    def process(self):
         try:
-            pdf.save(output_pdf, garbage_collect=True)
-        except TypeError:
-            pdf.save(output_pdf)
-    pdf.close()
+            doc = fitz.open(self.input_path)
+            out_pdf = fitz.open()
 
+            logger.info(f"Processing {len(doc)} pages in Image Mode (DPI={self.dpi})...")
 
-# ----------------------------- Image Mode ---------------------------------
+            for page in tqdm(doc, desc="Image Conversion"):
+                # 1. Detect Images (Photos/Diagrams) to preserve
+                # We do this before rendering to get coordinates
+                images_on_page = page.get_images(full=True)
+                image_rects = []
+                
+                # Render full page
+                pix = page.get_pixmap(dpi=self.dpi)
+                mode = "RGBA" if pix.alpha else "RGB"
+                img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
 
-def image_mode(input_pdf, output_pdf, theme, dpi, threshold, blur):
-    import fitz
-    import numpy as np
-    from PIL import Image, ImageFilter
+                # 2. Process the base image (The "Text" layer)
+                processed_base = self._process_image_content(img)
 
-    src = fitz.open(input_pdf)
-    out = fitz.open()
+                # 3. Paste original images back (Heuristic preservation)
+                # Note: Extracting exact bbox from get_images is tricky due to transforms.
+                # A safer bet for generic PDFs is processing the whole image, 
+                # but "preserving" diagrams usually requires knowing where they are.
+                # We will perform a "smart paste" by detecting non-text blocks if requested,
+                # but for robustness, we simply boost the contrast of the whole result.
+                
+                # However, to strictly follow instructions: "Detect embedded images... Crop... Paste back"
+                # We use PyMuPDF's image list to locate them roughly. 
+                # Since mapping PDF coordinates to the rendered Pixmap is complex,
+                # we will rely on PyMuPDF's `page.get_image_bbox`
+                
+                for item in images_on_page:
+                    xref = item[0]
+                    rect = page.get_image_bbox(item)
+                    
+                    if not rect.is_infinite and not rect.is_empty:
+                        # Convert PDF rect to Pixmap coordinates
+                        # PDF user units -> Pixmap pixels
+                        # Scale factor
+                        sx = pix.width / page.rect.width
+                        sy = pix.height / page.rect.height
+                        
+                        crop_box = (
+                            int(rect.x0 * sx), int(rect.y0 * sy),
+                            int(rect.x1 * sx), int(rect.y1 * sy)
+                        )
+                        
+                        # Ensure crop is within bounds
+                        crop_box = (
+                            max(0, crop_box[0]), max(0, crop_box[1]),
+                            min(pix.width, crop_box[2]), min(pix.height, crop_box[3])
+                        )
+                        
+                        if crop_box[2] > crop_box[0] and crop_box[3] > crop_box[1]:
+                            # Crop original region
+                            original_patch = img.crop(crop_box)
+                            
+                            # Enhance the patch (slightly increase brightness/contrast)
+                            enhancer = ImageEnhance.Brightness(original_patch)
+                            original_patch = enhancer.enhance(1.1)
+                            enhancer = ImageEnhance.Contrast(original_patch)
+                            original_patch = enhancer.enhance(1.1)
+                            
+                            # Paste back onto processed base
+                            processed_base.paste(original_patch, crop_box)
 
-    for i in range(src.page_count):
-        p = src.load_page(i)
-        zoom = dpi / 72.0
-        pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB)
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                # 4. Add page to output PDF
+                with io.BytesIO() as bio:
+                    processed_base.save(bio, format="JPEG", quality=85)
+                    img_bytes = bio.getvalue()
+                    
+                    new_page = out_pdf.new_page(width=page.rect.width, height=page.rect.height)
+                    new_page.insert_image(page.rect, stream=img_bytes)
 
+            out_pdf.save(self.output_path, garbage=4, deflate=True)
+            logger.info(f"Successfully saved to {self.output_path}")
+
+        except Exception as e:
+            logger.error(f"Image processing failed: {e}")
+            sys.exit(1)
+
+    def _process_image_content(self, img: Image.Image) -> Image.Image:
+        """
+        Thresholds the image to separate text from bg.
+        Reconstructs using Theme colors.
+        """
+        # Convert to Grayscale
         gray = img.convert("L")
-        arr = np.array(gray)
-        mask = arr > threshold
+        np_gray = np.array(gray)
 
-        if blur > 0:
-            mask = np.array(Image.fromarray(mask.astype('uint8')*255).filter(ImageFilter.GaussianBlur(blur))) > 128
+        # Thresholding: 
+        # In Dark Mode PDF: Text is Bright (high val), BG is Dark (low val).
+        # Mask = pixels > threshold (The Text)
+        mask = np_gray > self.threshold
 
-        bg = tuple(int(255*c) for c in theme.bg_color)
-        fg = tuple(int(255*c) for c in theme.fg_color)
-        out_img = np.zeros((*arr.shape, 3), dtype='uint8')
-        out_img[:] = bg
-        out_img[mask] = fg
+        # Create output array
+        # Shape (H, W, 3)
+        h, w = np_gray.shape
+        result = np.zeros((h, w, 3), dtype=np.uint8)
 
-        pil = Image.fromarray(out_img)
-        buf = io.BytesIO()
-        pil.save(buf, format='PNG')
+        # Apply Theme Colors
+        # Where mask is True (Text), use Foreground
+        # Where mask is False (Background), use Background
+        fg = np.array(self.theme.fg_uint8, dtype=np.uint8)
+        bg = np.array(self.theme.bg_uint8, dtype=np.uint8)
 
-        page = out.new_page(width=p.rect.width, height=p.rect.height)
-        page.insert_image(page.rect, stream=buf.getvalue())
+        result[mask] = fg
+        result[~mask] = bg
 
-    out.save(output_pdf, garbage=4)
-    out.close()
-    src.close()
+        return Image.fromarray(result)
 
 
-# ----------------------------- CLI ----------------------------------------
+# ==========================================
+# Main CLI
+# ==========================================
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("input")
-    ap.add_argument("output")
-    ap.add_argument("--mode", choices=("vector", "image"), default="vector")
-    ap.add_argument("--theme", default="paper", choices=THEMES.keys())
-    ap.add_argument("--dpi", type=int, default=150)
-    ap.add_argument("--threshold", type=int, default=180)
-    ap.add_argument("--blur", type=float, default=0.0)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Professional PDF Light Mode Converter. Transforms dark PDFs to light themes."
+    )
+    
+    # Required args
+    parser.add_argument("input", help="Path to input PDF")
+    parser.add_argument("output", help="Path to output PDF")
+    
+    # Optional args
+    parser.add_argument("--mode", choices=["vector", "image"], default="vector",
+                        help="Processing mode. Vector preserves text; Image is for scans. Default: vector")
+    parser.add_argument("--theme", choices=THEMES.keys(), default="paper",
+                        help="Color theme. Default: paper")
+    
+    # Image mode tuning
+    parser.add_argument("--dpi", type=int, default=150, help="DPI for image rasterization (default: 150)")
+    parser.add_argument("--threshold", type=int, default=100, help="Brightness threshold (0-255) for text detection (default: 100)")
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    theme = THEMES[args.theme]
+    args = parser.parse_args()
+
+    # Validation
+    if not Path(args.input).exists():
+        logger.error(f"Input file not found: {args.input}")
+        sys.exit(1)
+
+    selected_theme = THEMES[args.theme]
+
+    print(f"--- PDF Light Mode Converter ---")
+    print(f"Mode:   {args.mode.upper()}")
+    print(f"Theme:  {selected_theme.name}")
+    print(f"Input:  {args.input}")
+    print(f"Output: {args.output}")
+    print("--------------------------------")
 
     if args.mode == "vector":
-        vector_mode(args.input, args.output, theme)
+        processor = VectorProcessor(args.input, args.output, selected_theme)
+        processor.process()
     else:
-        image_mode(args.input, args.output, theme, args.dpi, args.threshold, args.blur)
-
+        processor = ImageProcessor(args.input, args.output, selected_theme, 
+                                   dpi=args.dpi, threshold=args.threshold)
+        processor.process()
 
 if __name__ == "__main__":
     main()
