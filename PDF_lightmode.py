@@ -67,29 +67,26 @@ THEMES = {
 
 
 class ColorUtils:
-    """Helper methods for PDF color space conversions and luminance logic."""
-
     @staticmethod
     def get_luminance(r: float, g: float, b: float) -> float:
-        """Calculates perceptual luminance (Rec. 709)."""
+        """Calculates perceptual luminance."""
         return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
     @staticmethod
     def cmyk_to_rgb(c: float, m: float, y: float, k: float) -> Tuple[float, float, float]:
-        """Simple CMYK to RGB conversion."""
-        r = (1.0 - c) * (1.0 - k)
-        g = (1.0 - m) * (1.0 - k)
-        b = (1.0 - y) * (1.0 - k)
-        return r, g, b
+        """Converts CMYK to RGB approximation."""
+        return (1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)
 
     @staticmethod
     def normalize_args(args: List) -> List[float]:
-        """
-        Converts PikePDF arguments to standard python floats.
-        Handles integers, floats, and pikepdf numeric objects.
-        """
-        return [float(x) for x in args]
-
+        """Safely converts any numeric PDF operand to a Python float."""
+        result = []
+        for x in args:
+            try:
+                result.append(float(x))
+            except (TypeError, ValueError):
+                continue
+        return result
 
 # ==========================================
 # Processor 1: Vector-Native (PikePDF)
@@ -100,62 +97,49 @@ class VectorProcessor:
         self.input_path = input_path
         self.output_path = output_path
         self.theme = theme
-        self.color_ops = {'g', 'G', 'rg', 'RG', 'k', 'K'}
+        self.color_ops = {'g', 'G', 'rg', 'RG', 'k', 'K', 'sc', 'SC', 'scn', 'SCN'}
+        self.text_ops = {'Tj', 'TJ', "'", '"'}
 
     def process(self):
         try:
             with pikepdf.Pdf.open(self.input_path) as pdf:
-                logger.info("Scanning for XObjects and Page streams...")
+                logger.info("Performing deep visibility scan...")
                 
-                # 1. Iterate over all indirect objects to find Form XObjects
-                # Fix: pdf.objects is a sequence, not a dict
-                for obj in tqdm(pdf.objects, desc="Processing XObjects"):
+                # 1. Neutralize Transparency (FIXED: pdf.Root instead of pdf.root)
+                if '/ExtGState' in pdf.Root:
+                    for _, gs in pdf.Root.ExtGState.items():
+                        # Blend mode 'Screen' makes text disappear on white; force Normal
+                        if '/BM' in gs: 
+                            gs.BM = pikepdf.Name('/Normal')
+                        # Force full opacity
+                        if '/ca' in gs: gs.ca = 1.0
+                        if '/CA' in gs: gs.CA = 1.0
+
+                for obj in tqdm(pdf.objects, desc="Fixing XObjects"):
                     if isinstance(obj, pikepdf.Stream):
-                        # Safely check types without triggering exceptions on non-dict streams
                         try:
                             if obj.get('/Type') == '/XObject' and obj.get('/Subtype') == '/Form':
                                 self._rewrite_stream(obj, pdf, is_page=False)
-                        except (AttributeError, KeyError):
-                            continue
+                        except (AttributeError, KeyError): continue
 
-                # 2. Process Page Streams
-                for page in tqdm(pdf.pages, desc="Processing Pages"):
+                for page in tqdm(pdf.pages, desc="Fixing Pages"):
                     self._rewrite_stream(page, pdf, is_page=True)
 
-                # Save with compression and object stream generation
-                pdf.save(self.output_path, compress_streams=True, 
-                         object_stream_mode=pikepdf.ObjectStreamMode.generate)
-                
-            logger.info(f"Successfully saved to {self.output_path}")
+                pdf.save(self.output_path, compress_streams=True)
+            logger.info(f"Process complete: {self.output_path}")
         except Exception as e:
-            logger.error(f"Vector processing failed: {e}")
-            raise
+            logger.error(f"Vector processing failed: {e}"); raise
 
     def _rewrite_stream(self, target, pdf, is_page=True):
-        """
-        Universal stream rewriter.
-        target: pikepdf.Page (if is_page) or pikepdf.Stream (if XObject)
-        """
         try:
-            # parse_content_stream works on both Page and Stream objects
             commands = pikepdf.parse_content_stream(target)
-        except Exception:
-            return 
+        except: return
 
         new_commands = []
-        
-        # Determine boundaries for Background Neutralization
-        # Pages use MediaBox; XObjects use BBox
         bbox_obj = target.get('/MediaBox') if is_page else target.get('/BBox')
+        m = [float(x) for x in bbox_obj] if bbox_obj else None
         
-        if bbox_obj:
-            m = [float(x) for x in bbox_obj]
-            w, h = m[2] - m[0], m[3] - m[1]
-            area_threshold = (w * h) * 0.8
-        else:
-            m, area_threshold = None, 0
-
-        # Prepend a full-page theme background for Page objects
+        # 2. Page Background
         if is_page and m:
             new_commands.append(([], pikepdf.Operator("q")))
             new_commands.append((list(self.theme.bg_color), pikepdf.Operator("rg")))
@@ -163,59 +147,72 @@ class VectorProcessor:
             new_commands.append(([], pikepdf.Operator("f")))
             new_commands.append(([], pikepdf.Operator("Q")))
 
-        current_fill_color = (0.0, 0.0, 0.0)
-
+        cur_fill = (0.0, 0.0, 0.0)
+        
         for operands, operator in commands:
             op_str = str(operator)
             
+            # 3. Handle Graphics States
+            if op_str == 'gs':
+                new_commands.append((operands, operator))
+                # Reset text color immediately after a state change
+                new_commands.append((list(self.theme.fg_color), pikepdf.Operator("rg")))
+                continue
+
+            # 4. Color Mapping Logic
             if op_str in self.color_ops:
                 clean_ops = ColorUtils.normalize_args(operands)
-                transformed = self._transform_color(clean_ops, op_str)
-                # Keep track of fill color for rectangle neutralization
-                if op_str in ['g', 'rg', 'k']:
-                    current_fill_color = self._get_rgb_approx(clean_ops, op_str)
-                new_commands.append((transformed, operator))
-            
-            # Neutralize large dark rectangles
-            elif op_str == 're' and area_threshold > 0:
+                if not clean_ops:
+                    new_commands.append((operands, operator))
+                    continue
+                
+                r, g, b = self._get_rgb_approx(clean_ops, op_str)
+                lum = ColorUtils.get_luminance(r, g, b)
+                
+                # Broaden the foreground threshold: if it's light, make it dark
+                target_color = list(self.theme.fg_color) if lum > 0.3 else list(self.theme.bg_color)
+                
+                if op_str.islower(): cur_fill = (target_color[0], target_color[1], target_color[2])
+                new_ops = self._map_to_op_format(target_color, op_str, len(clean_ops))
+                new_commands.append((new_ops, operator))
+
+            # 5. Text Failsafe
+            elif op_str in self.text_ops:
+                # If current fill is too light for white paper, force dark
+                if ColorUtils.get_luminance(*cur_fill) > 0.5:
+                    new_commands.append((list(self.theme.fg_color), pikepdf.Operator("rg")))
+                    cur_fill = self.theme.fg_color
+                new_commands.append((operands, operator))
+
+            # 6. Rectangle Neutralizer
+            elif op_str == 're' and m:
                 ops = ColorUtils.normalize_args(operands)
-                if (ops[2] * ops[3]) > area_threshold:
-                    lum = ColorUtils.get_luminance(*current_fill_color)
-                    if lum < 0.5: # If it's a large dark background shape
+                if len(ops) == 4 and (ops[2]*ops[3]) > ((m[2]-m[0])*(m[3]-m[1])*0.6):
+                    if ColorUtils.get_luminance(*cur_fill) < 0.5:
                         new_commands.append((list(self.theme.bg_color), pikepdf.Operator("rg")))
                 new_commands.append((operands, operator))
             else:
                 new_commands.append((operands, operator))
 
-        # Write data back to the correct location
         new_data = pikepdf.unparse_content_stream(new_commands)
-        if is_page:
-            target.Contents = pdf.make_stream(new_data)
-        else:
-            # For XObjects, we write directly to the stream object
-            target.write(new_data)
+        if is_page: target.Contents = pdf.make_stream(new_data)
+        else: target.write(new_data)
 
     def _get_rgb_approx(self, ops, op):
-        """Internal helper to track the current fill color for the Neutralizer."""
-        if op == 'g': return (ops[0], ops[0], ops[0])
-        if op == 'rg': return (ops[0], ops[1], ops[2])
-        if op == 'k': return ColorUtils.cmyk_to_rgb(*ops)
-        return (0, 0, 0)
+        if op in ['g', 'G']: return ops[0], ops[0], ops[0]
+        if op in ['rg', 'RG']: return ops[0], ops[1], ops[2]
+        if op in ['k', 'K']: return ColorUtils.cmyk_to_rgb(*ops[:4])
+        if len(ops) == 1: return ops[0], ops[0], ops[0]
+        if len(ops) == 3: return ops[0], ops[1], ops[2]
+        if len(ops) == 4: return ColorUtils.cmyk_to_rgb(*ops)
+        return 0.0, 0.0, 0.0
 
-    def _transform_color(self, operands, operator):
-        # Maps color to theme based on luminance
-        r, g, b = self._get_rgb_approx(operands, operator)
-        lum = ColorUtils.get_luminance(r, g, b)
-        
-        target = list(self.theme.fg_color) if lum > 0.5 else list(self.theme.bg_color)
-
-        if operator in ['g', 'G']: return [ColorUtils.get_luminance(*target)]
-        if operator in ['rg', 'RG']: return target
-        if operator in ['k', 'K']: 
-            # Simplified CMYK mapping
-            return [0, 0, 0, 1] if lum > 0.5 else [0, 0, 0, 0]
-        return operands
-
+    def _map_to_op_format(self, target_rgb, op, original_len):
+        if op in ['g', 'G'] or original_len == 1:
+            return [ColorUtils.get_luminance(*target_rgb)]
+        if op in ['k', 'K'] or original_len == 4:
+            return [0.0, 0.0, 0.0, 1.0] if target_rgb[0] < 0.5 else [0.0, 0.0, 0.0, 0.0]
+        return target_rgb
 
 # ==========================================
 # Processor 2: Image-Based Fallback (PyMuPDF)
