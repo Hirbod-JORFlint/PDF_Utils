@@ -113,7 +113,8 @@ class WatermarkGUI(QMainWindow):
         settings_layout.addWidget(QLabel("Page Range (e.g., '0, 2-4'):"))
         self.txt_pages = QLineEdit()
         self.txt_pages.setPlaceholderText("Leave empty for all pages")
-
+        self.txt_pages.textChanged.connect(self.update_preview)
+        
         settings_layout.addWidget(self.combo_pos)
         settings_layout.addWidget(self.spin_opacity)
         settings_layout.addWidget(self.spin_rotate)
@@ -181,41 +182,74 @@ class WatermarkGUI(QMainWindow):
             self.lbl_img_path.setText(f"Selected: {file_path.split('/')[-1]}")
 
     def update_preview(self):
-        """Generates a preview of the first page, handling passwords."""
-        if not self.input_path:
-            return
+            """Generates a preview of the specific page selected in the range."""
+            if not self.input_path:
+                return
 
-        try:
-            doc = fitz.open(self.input_path)
-            
-            # Handle Password
-            if doc.needs_pass:
-                pwd = self.txt_password.text()
-                if not doc.authenticate(pwd):
-                    self.preview_area.setText("🔒 PDF is Locked.\nEnter Password to Preview.")
+            try:
+                doc = fitz.open(self.input_path)
+                
+                # 1. Handle Password
+                if doc.needs_pass:
+                    pwd = self.txt_password.text()
+                    if not doc.authenticate(pwd):
+                        self.preview_area.setText("🔒 PDF is Locked.\nEnter Password to Preview.")
+                        doc.close()
+                        return
+
+                # 2. Determine which page to show
+                page_index = 0 # Default to first page
+                page_text = self.txt_pages.text().strip()
+                
+                if page_text:
+                    try:
+                        # Logic: Get the first number from strings like "3-5, 10" or "2, 4"
+                        # Step A: Split by comma to get first group ("3-5")
+                        first_group = page_text.split(',')[0].strip()
+                        # Step B: Split by dash to get start of range ("3")
+                        first_num_str = first_group.split('-')[0].strip()
+                        
+                        if first_num_str.isdigit():
+                            val = int(first_num_str)
+                            # User input is 1-based, internal PDF is 0-based
+                            if val > 0:
+                                page_index = val - 1
+                    except ValueError:
+                        pass # Fallback to 0 if parsing fails
+
+                # 3. Boundary Check (Prevent crashing if user types '100' for a 5-page doc)
+                total_pages = doc.page_count
+                if page_index >= total_pages:
+                    self.preview_area.setText(f"Page {page_index + 1} out of range\n(Doc has {total_pages} pages)")
                     doc.close()
                     return
 
-            # Load first page
-            page = doc.load_page(0) 
-            pix = page.get_pixmap(matrix=fitz.Matrix(0.6, 0.6)) # Scale down slightly for UI
-            
-            fmt = QImage.Format.Format_RGB888
-            qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
-            pixmap = QPixmap.fromImage(qimg)
-            
-            # Display
-            self.preview_area.setPixmap(pixmap.scaled(
-                self.preview_area.width(), 
-                self.preview_area.height(), 
-                Qt.AspectRatioMode.KeepAspectRatio, 
-                Qt.TransformationMode.SmoothTransformation
-            ))
-            doc.close()
-            
-        except Exception as e:
-            self.preview_area.setText(f"Error loading preview: {e}")
-
+                # 4. Load & Render Page
+                page = doc.load_page(page_index) 
+                
+                # Render at slightly higher quality
+                pix = page.get_pixmap(matrix=fitz.Matrix(0.8, 0.8)) 
+                
+                fmt = QImage.Format.Format_RGB888
+                qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
+                pixmap = QPixmap.fromImage(qimg)
+                
+                # Display
+                self.preview_area.setPixmap(pixmap.scaled(
+                    self.preview_area.width(), 
+                    self.preview_area.height(), 
+                    Qt.AspectRatioMode.KeepAspectRatio, 
+                    Qt.TransformationMode.SmoothTransformation
+                ))
+                
+                # Update label to confirm which page is being shown
+                self.lbl_file.setText(f"Previewing Page {page_index + 1} of {total_pages}")
+                
+                doc.close()
+                
+            except Exception as e:
+                self.preview_area.setText(f"Error loading preview: {e}")
+                
     def save_pdf(self):
         if not self.input_path:
             self.lbl_file.setText("Error: No PDF selected!")
