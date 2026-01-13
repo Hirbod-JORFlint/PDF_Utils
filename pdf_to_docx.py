@@ -218,7 +218,13 @@ def extract_page_content(page):
                 for ln in para_lines[1:]:
                     center_y = (ln['bbox'][1] + ln['bbox'][3]) / 2.0
                     gap = abs(center_y - prev_center_y)
-                    threshold = max(6.0, 0.75 * current_font)
+                    # previous: threshold = max(6.0, 0.75 * current_font)
+                    # Improved: use both an absolute minimum and a fraction of the font size,
+                    # but use the actual bbox vertical gap to decide. This reduces accidental merges.
+                    # current_font is in points.
+                    min_gap_pts = 3.0  # don't treat sub-3pt differences as same-line
+                    rel_gap_factor = 0.45  # fraction of font size to accept as same-line
+                    threshold = max(min_gap_pts, rel_gap_factor * current_font)
 
                     if gap <= threshold:
                         last_span = current['spans'][-1]
@@ -341,68 +347,99 @@ def write_to_docx(doc, elements, page_width, page_height):
             pf.space_after = Pt(0)
 
             for line in el['lines']:
-                for span in line['spans']:
-                    text = span['text']
+                spans = line['spans']
+                for si, span in enumerate(spans):
+                    text = span.get('text') or ''
                     if not text:
                         continue
 
-                    # Handle Hyperlinks (preserve existing approach but set fonts/size)
+                    # If there is an explicit link in this span, keep previous hyperlink logic
                     if span.get('link'):
                         rgb = int_to_rgb(span['color'])
                         is_bold = bool(span['flags'] & 16)
                         is_italic = bool(span['flags'] & 2)
                         fname = map_font_name(span.get('font'), span.get('flags'))
-                        # Use add_hyperlink, but ensure it also sets rFonts and size:
                         add_hyperlink(p, span['link'], text, rgb, is_bold, is_italic, fname, span.get('size'))
-                        continue
+                        # continue to possible spacing logic below (we still may want a space after the link)
+                    else:
+                        run = p.add_run(text)
 
-                    run = p.add_run(text)
-
-                    # Preferred way to set fonts that works across scripts:
-                    font_name = map_font_name(span.get('font'))
-                    run.font.name = font_name
-                    # also set rFonts on the run xml so Word sees it for ascii/eastAsia
-                    r = run._element
-                    rPr = r.get_or_add_rPr() if hasattr(r, "get_or_add_rPr") else None
-                    # Fallback safe approach:
-                    try:
-                        rfonts = OxmlElement('w:rFonts')
-                        rfonts.set(qn('w:ascii'), font_name)
-                        rfonts.set(qn('w:hAnsi'), font_name)
-                        rfonts.set(qn('w:eastAsia'), font_name)
-                        if rPr is None:
-                            rPr = OxmlElement('w:rPr')
-                            r.append(rPr)
-                        rPr.append(rfonts)
-                    except Exception:
-                        # ignore if low-level xml manipulation isn't possible
-                        pass
-
-                    # Size
-                    try:
-                        if span.get('size'):
-                            run.font.size = Pt(span['size'])
-                    except Exception:
-                        pass
-
-                    # Color
-                    rgb = int_to_rgb(span.get('color'))
-                    if rgb != (0, 0, 0):
+                        # font name + rFonts xml
+                        font_name = map_font_name(span.get('font'))
+                        run.font.name = font_name
                         try:
-                            run.font.color.rgb = RGBColor(*rgb)
+                            rfonts = OxmlElement('w:rFonts')
+                            rfonts.set(qn('w:ascii'), font_name)
+                            rfonts.set(qn('w:hAnsi'), font_name)
+                            rfonts.set(qn('w:eastAsia'), font_name)
+                            rPr = run._element.get_or_add_rPr()
+                            rPr.append(rfonts)
                         except Exception:
                             pass
 
-                    # Styles
-                    flags = span.get('flags', 0)
-                    if flags & 16:
-                        run.bold = True
-                    if flags & 2:
-                        run.italic = True
-                    if flags & 1:
-                        # Some PDF flags use the low bit for superscript — map to python-docx property
-                        run.font.superscript = True                        
-                # Add implicit space or break?
+                        # size
+                        try:
+                            if span.get('size'):
+                                run.font.size = Pt(span['size'])
+                        except Exception:
+                            pass
+
+                        # color
+                        rgb = int_to_rgb(span.get('color'))
+                        if rgb != (0, 0, 0):
+                            try:
+                                run.font.color.rgb = RGBColor(*rgb)
+                            except Exception:
+                                pass
+
+                        # styles
+                        flags = span.get('flags', 0)
+                        if flags & 16:
+                            run.bold = True
+                        if flags & 2:
+                            run.italic = True
+                        if flags & 1:
+                            run.font.superscript = True
+
+                    # --- determine if we should insert a visible space between this span and the next ---
+                    need_space = False
+                    if si + 1 < len(spans):
+                        next_span = spans[si + 1]
+                        try:
+                            # gap in PDF points between current span right and next span left
+                            gap_pts = next_span['bbox'][0] - span['bbox'][2]
+                        except Exception:
+                            gap_pts = 0.0
+
+                        # Use font size (in pts) as a scale for what counts as a visible gap
+                        font_pt = span.get('size') or 12.0
+                        # threshold: small minimum (1pt) plus a fraction of font size
+                        gap_threshold = max(1.0, 0.18 * font_pt)
+
+                        # Next text starts with punctuation? then usually NO space even if gap exists
+                        next_text = (next_span.get('text') or '').lstrip()
+                        if gap_pts > gap_threshold and not re.match(r'^[,.;:?!\)\]\}%/]', next_text):
+                            need_space = True
+
+                    if need_space:
+                        # insert a space run with the same font properties so Word renders it consistently
+                        space_run = p.add_run(' ')
+                        try:
+                            space_run.font.name = map_font_name(span.get('font'))
+                            if span.get('size'):
+                                space_run.font.size = Pt(span.get('size'))
+                            if rgb != (0, 0, 0):
+                                try:
+                                    space_run.font.color.rgb = RGBColor(*rgb)
+                                except Exception:
+                                    pass
+                            if flags & 16:
+                                space_run.bold = True
+                            if flags & 2:
+                                space_run.italic = True
+                        except Exception:
+                            pass
+
 
 # ==========================================
 # Main
