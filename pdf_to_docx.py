@@ -50,25 +50,26 @@ def int_to_rgb(color_value):
         return tuple(map(int, color_value[:3]))
     return (0, 0, 0)
 
-def map_font_name(fname, flags):
+def map_font_name(fname, flags=None):
     """
     Map PDF font names to standard Word fonts to improve visual fidelity.
+    - Normalizes subset prefixes (AAAAAA+FontName), suffix tokens, and casing.
+    - Tries to preserve family (serif/sans/mono) and common names.
     """
-	if not fname: return "Calibri"
-		
-		# Remove CID or Identity-H suffixes
-	fname = fname.split('+')[-1] # Remove subset prefix
-	fname = fname.split('-')[0]  # Remove encoding suffixes
-    
-    fname_lower = fname.lower()
-    # strip 6-letter subset prefix if present
+    if not fname:
+        return "Calibri"
+
+    # Remove subset prefix like "ABCDEE+FontName" and any encoding suffix
+    fname = fname.split('+')[-1]
+    fname = fname.split('-')[0]
+
+    # Clean common suffix tokens and punctuation
     fname_clean = re.sub(r'^[A-Z]{6}\+', '', fname)
-    # remove common suffixes/tokens and punctuation that often appear in PDF font names
-    fname_clean = re.sub(r'[-_,.](bold|italic|regular|mt|ps|std|roman|oblique|semi|condensed|narrow)$', '', fname_clean, flags=re.I)
-    fname_clean = fname_clean.strip()
+    fname_clean = re.sub(r'[-_,.](bold|italic|regular|mt|ps|std|roman|oblique|semi|condensed|narrow)$',
+                        '', fname_clean, flags=re.I).strip()
     fname_lower = fname_clean.lower()
 
-    # Common family mappings
+    # family heuristics
     if "times" in fname_lower or "serif" in fname_lower:
         return "Times New Roman"
     if "arial" in fname_lower or "helvetica" in fname_lower:
@@ -82,8 +83,8 @@ def map_font_name(fname, flags):
     if "georgia" in fname_lower:
         return "Georgia"
 
-    # Final fallback: return cleaned name or Calibri if empty
-    return fname_clean if fname_clean else "Calibri"
+    # Fallback:
+    return fname_clean or "Calibri"
 
 def add_hyperlink(paragraph, url, text, color, is_bold, is_italic, font_name, font_size):
     """
@@ -161,15 +162,10 @@ def analyze_columns_simple(spans, page_width):
     return [(0, page_width)] 
 
 def extract_page_content(page):
-    """
-    Extracts content including Hyperlinks and Layout details.
-    """
     elements = []
-    
-    # 0. Get Links
     links = page.get_links()
 
-    # 1. Detect Tables
+    # 1. Tables
     table_rects = []
     tables = page.find_tables()
     for tab in tables:
@@ -182,13 +178,11 @@ def extract_page_content(page):
             'data': tab.extract()
         })
 
-    # 2. Extract Text & Images
+    # 2. Text & Images
     text_blocks = page.get_text("dict")["blocks"]
     
     for b in text_blocks:
         bbox = b['bbox']
-        
-        # Skip if inside table
         if any(is_box_inside(bbox, tr) for tr in table_rects):
             continue
 
@@ -197,9 +191,7 @@ def extract_page_content(page):
             for line in b['lines']:
                 line_spans = []
                 for span in line['spans']:
-                    # Check for link
                     uri = get_link_target(span['bbox'], links)
-                    
                     line_spans.append({
                         'text': span['text'],
                         'font': span['font'],
@@ -213,71 +205,62 @@ def extract_page_content(page):
                 if line_spans:
                     para_lines.append({'bbox': line['bbox'], 'spans': line_spans})
             
+            if para_lines:
+                paragraphs = []
+                def avg_font_size(line):
+                    sizes = [s.get('size') for s in line['spans'] if s.get('size')]
+                    return float(sizes[0]) if sizes else 12.0
 
-			if para_lines:
-				# Merge consecutive PDF lines into paragraphs using a vertical-gap heuristic.
-				paragraphs = []
-				def avg_font_size(line):
-					sizes = [s.get('size') for s in line['spans'] if s.get('size')]
-					return float(sizes[0]) if sizes else 12.0
+                current = {'bbox': para_lines[0]['bbox'], 'spans': list(para_lines[0]['spans'])}
+                prev_center_y = (para_lines[0]['bbox'][1] + para_lines[0]['bbox'][3]) / 2.0
+                current_font = avg_font_size(para_lines[0])
 
-				# Start with first line as current paragraph
-				current = {'bbox': para_lines[0]['bbox'], 'spans': list(para_lines[0]['spans'])}
-				prev_center_y = (para_lines[0]['bbox'][1] + para_lines[0]['bbox'][3]) / 2.0
-				current_font = avg_font_size(para_lines[0])
+                for ln in para_lines[1:]:
+                    center_y = (ln['bbox'][1] + ln['bbox'][3]) / 2.0
+                    gap = abs(center_y - prev_center_y)
+                    threshold = max(6.0, 0.75 * current_font)
 
-				for ln in para_lines[1:]:
-					center_y = (ln['bbox'][1] + ln['bbox'][3]) / 2.0
-					gap = abs(center_y - prev_center_y)
-
-					# threshold = ~0.6–1.0 * font-size (empirical); adjust if needed
-					threshold = max(6.0, 0.75 * current_font)
-
-					if gap <= threshold:
-                        # Check for hyphenation at the end of the previous line
-                        last_text = current['spans'][-1]['text'].strip()
-                        if last_text.endswith('-') and len(last_text) > 3:
-                            # Remove hyphen and don't add space
-                            current['spans'][-1]['text'] = current['spans'][-1]['text'].rstrip('-')
+                    if gap <= threshold:
+                        last_span = current['spans'][-1]
+                        if last_span['text'].rstrip().endswith('-') and len(last_span['text'].strip()) > 1:
+                            last_span['text'] = last_span['text'].rstrip().rstrip('-')
                         else:
-                            # Add a space between lines if the last span doesn't end in one
-                            if not current['spans'][-1]['text'].endswith(' '):
-                                current['spans'][-1]['text'] += ' '
-                        
+                            if not last_span['text'].endswith(' '):
+                                last_span['text'] += ' '
                         current['spans'].extend(ln['spans'])
+                        c = list(current['bbox'])
+                        c[2] = max(c[2], ln['bbox'][2])
+                        c[3] = max(c[3], ln['bbox'][3])
+                        current['bbox'] = tuple(c)
                         prev_center_y = center_y
-					else:
-						# Close current paragraph and start a new one
-						paragraphs.append(current)
-						current = {'bbox': ln['bbox'], 'spans': list(ln['spans'])}
-						prev_center_y = center_y
-						current_font = avg_font_size(ln)
+                    else:
+                        paragraphs.append(current)
+                        current = {'bbox': ln['bbox'], 'spans': list(ln['spans'])}
+                        prev_center_y = center_y
+                        current_font = avg_font_size(ln)
 
-				paragraphs.append(current)
+                paragraphs.append(current)
 
-				# Add one element per logical paragraph (each element.lines is a list of 1 item: the merged paragraph)
-				for para in paragraphs:
-					elements.append({
-						'type': 'text',
-						'bbox': bbox,
-						'y_sort': para['bbox'][1] if isinstance(para['bbox'], (list, tuple)) else bbox[1],
-						'lines': [para],
-						'indent_pt': bbox[0]
-					})
-					
+                for para in paragraphs:
+                    elements.append({
+                        'type': 'text',
+                        'bbox': para['bbox'],
+                        'y_sort': para['bbox'][1],
+                        'lines': [para],
+                        'indent_pt': para['bbox'][0]
+                    })
+                    
         elif b['type'] == 1:  # Image
             img_bytes = b.get("image")
-            ext = b.get("ext", "png")
             if img_bytes:
                 elements.append({
                     'type': 'image',
                     'bbox': bbox,
                     'y_sort': bbox[1],
                     'bytes': img_bytes,
-                    'ext': ext
+                    'ext': b.get("ext", "png")
                 })
 
-    # Sort by Vertical position
     elements.sort(key=lambda x: x['y_sort'])
     return elements
 
@@ -351,73 +334,75 @@ def write_to_docx(doc, elements, page_width, page_height):
         elif el['type'] == 'text':
             p = doc.add_paragraph()
             pf = p.paragraph_format
-            
-            # 1. Indentation
-            # Calculate relative indent from the left margin buffer
             raw_indent = el['indent_pt']
             relative_indent = raw_indent - margin_buffer
             if relative_indent > 0:
                 pf.left_indent = Pt(relative_indent)
-            
-            # 2. Spacing (Tight packing)
-            # Remove space after paragraph to prevent giant gaps
             pf.space_after = Pt(0)
-            
-            # 3. Process Runs
+
             for line in el['lines']:
                 for span in line['spans']:
                     text = span['text']
-                    
-                    # Handle Hyperlinks
-                    if span['link']:
+                    if not text:
+                        continue
+
+                    # Handle Hyperlinks (preserve existing approach but set fonts/size)
+                    if span.get('link'):
                         rgb = int_to_rgb(span['color'])
                         is_bold = bool(span['flags'] & 16)
                         is_italic = bool(span['flags'] & 2)
-                        fname = map_font_name(span['font'], span['flags'])
-                        add_hyperlink(p, span['link'], text, rgb, is_bold, is_italic, fname, span['size'])
+                        fname = map_font_name(span.get('font'), span.get('flags'))
+                        # Use add_hyperlink, but ensure it also sets rFonts and size:
+                        add_hyperlink(p, span['link'], text, rgb, is_bold, is_italic, fname, span.get('size'))
                         continue
 
-                    if not text: continue
-                    
                     run = p.add_run(text)
-                    
-                    # Font Name
-                    run.font.name = map_font_name(span['font'], span['flags'])
-                    
+
+                    # Preferred way to set fonts that works across scripts:
+                    font_name = map_font_name(span.get('font'))
+                    run.font.name = font_name
+                    # also set rFonts on the run xml so Word sees it for ascii/eastAsia
+                    r = run._element
+                    rPr = r.get_or_add_rPr() if hasattr(r, "get_or_add_rPr") else None
+                    # Fallback safe approach:
+                    try:
+                        rfonts = OxmlElement('w:rFonts')
+                        rfonts.set(qn('w:ascii'), font_name)
+                        rfonts.set(qn('w:hAnsi'), font_name)
+                        rfonts.set(qn('w:eastAsia'), font_name)
+                        if rPr is None:
+                            rPr = OxmlElement('w:rPr')
+                            r.append(rPr)
+                        rPr.append(rfonts)
+                    except Exception:
+                        # ignore if low-level xml manipulation isn't possible
+                        pass
+
                     # Size
                     try:
-                        run.font.size = Pt(span['size'])
-                    except:
+                        if span.get('size'):
+                            run.font.size = Pt(span['size'])
+                    except Exception:
                         pass
-                    
+
                     # Color
-                    rgb = int_to_rgb(span['color'])
+                    rgb = int_to_rgb(span.get('color'))
                     if rgb != (0, 0, 0):
-                        run.font.color.rgb = RGBColor(*rgb)
-                    
-                    # Styles based on flags
-                    # bit 0: superscript
-                    # bit 1: italic
-                    # bit 2: serif
-                    # bit 3: monospaced
-                    # bit 4: bold
-                    flags = span['flags']
+                        try:
+                            run.font.color.rgb = RGBColor(*rgb)
+                        except Exception:
+                            pass
+
+                    # Styles
+                    flags = span.get('flags', 0)
                     if flags & 16:
                         run.bold = True
                     if flags & 2:
                         run.italic = True
                     if flags & 1:
-                        run.font.superscript = True
-                        
+                        # Some PDF flags use the low bit for superscript — map to python-docx property
+                        run.font.superscript = True                        
                 # Add implicit space or break?
-				# preserve intra-span spacing: add a space at the end only when needed
-				txt = text
-				if txt and not txt.endswith(' '):
-					# peek next span text if available (to decide whether a space is needed)
-					# If there's no easy peek (complexity), it's safe to append a single space here
-					# to avoid word concatenation — the merge step above already reduces line breaks.
-					txt = txt
-				run = p.add_run(txt)
 
 # ==========================================
 # Main
