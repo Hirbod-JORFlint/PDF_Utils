@@ -54,38 +54,36 @@ def map_font_name(fname, flags):
     """
     Map PDF font names to standard Word fonts to improve visual fidelity.
     """
-    if not fname:
-        return "Calibri"
+	if not fname: return "Calibri"
+		
+		# Remove CID or Identity-H suffixes
+	fname = fname.split('+')[-1] # Remove subset prefix
+	fname = fname.split('-')[0]  # Remove encoding suffixes
     
     fname_lower = fname.lower()
-    
-    # Remove subset tags (e.g., "ABCDE+Arial" -> "Arial")
-    if "+" in fname:
-        fname = fname.split("+")[1]
-    
-    # Common mappings
-    if "times" in fname_lower:
+    # strip 6-letter subset prefix if present
+    fname_clean = re.sub(r'^[A-Z]{6}\+', '', fname)
+    # remove common suffixes/tokens and punctuation that often appear in PDF font names
+    fname_clean = re.sub(r'[-_,.](bold|italic|regular|mt|ps|std|roman|oblique|semi|condensed|narrow)$', '', fname_clean, flags=re.I)
+    fname_clean = fname_clean.strip()
+    fname_lower = fname_clean.lower()
+
+    # Common family mappings
+    if "times" in fname_lower or "serif" in fname_lower:
         return "Times New Roman"
-    if "arial" in fname_lower:
+    if "arial" in fname_lower or "helvetica" in fname_lower:
         return "Arial"
-    if "courier" in fname_lower:
+    if "courier" in fname_lower or "mono" in fname_lower or "monospace" in fname_lower:
         return "Courier New"
-    if "helvetica" in fname_lower:
-        return "Arial"  # Arial is the standard substitute for Helvetica
     if "calibri" in fname_lower:
         return "Calibri"
     if "cambria" in fname_lower:
         return "Cambria"
-    
-    # Fallback based on flags if name is obscure
-    if flags & 2**2: # Serif
-        return "Times New Roman"
-    if flags & 2**3: # Monospaced
-        return "Courier New"
-        
-    # Clean up what remains (remove bold/italic suffixes for the name property)
-    clean = fname.split("-")[0]
-    return clean
+    if "georgia" in fname_lower:
+        return "Georgia"
+
+    # Final fallback: return cleaned name or Calibri if empty
+    return fname_clean if fname_clean else "Calibri"
 
 def add_hyperlink(paragraph, url, text, color, is_bold, is_italic, font_name, font_size):
     """
@@ -215,15 +213,58 @@ def extract_page_content(page):
                 if line_spans:
                     para_lines.append({'bbox': line['bbox'], 'spans': line_spans})
             
-            if para_lines:
-                elements.append({
-                    'type': 'text',
-                    'bbox': bbox,
-                    'y_sort': bbox[1],
-                    'lines': para_lines,
-                    'indent_pt': bbox[0] # Base absolute indent
-                })
-                
+
+			if para_lines:
+				# Merge consecutive PDF lines into paragraphs using a vertical-gap heuristic.
+				paragraphs = []
+				def avg_font_size(line):
+					sizes = [s.get('size') for s in line['spans'] if s.get('size')]
+					return float(sizes[0]) if sizes else 12.0
+
+				# Start with first line as current paragraph
+				current = {'bbox': para_lines[0]['bbox'], 'spans': list(para_lines[0]['spans'])}
+				prev_center_y = (para_lines[0]['bbox'][1] + para_lines[0]['bbox'][3]) / 2.0
+				current_font = avg_font_size(para_lines[0])
+
+				for ln in para_lines[1:]:
+					center_y = (ln['bbox'][1] + ln['bbox'][3]) / 2.0
+					gap = abs(center_y - prev_center_y)
+
+					# threshold = ~0.6–1.0 * font-size (empirical); adjust if needed
+					threshold = max(6.0, 0.75 * current_font)
+
+					if gap <= threshold:
+                        # Check for hyphenation at the end of the previous line
+                        last_text = current['spans'][-1]['text'].strip()
+                        if last_text.endswith('-') and len(last_text) > 3:
+                            # Remove hyphen and don't add space
+                            current['spans'][-1]['text'] = current['spans'][-1]['text'].rstrip('-')
+                        else:
+                            # Add a space between lines if the last span doesn't end in one
+                            if not current['spans'][-1]['text'].endswith(' '):
+                                current['spans'][-1]['text'] += ' '
+                        
+                        current['spans'].extend(ln['spans'])
+                        prev_center_y = center_y
+					else:
+						# Close current paragraph and start a new one
+						paragraphs.append(current)
+						current = {'bbox': ln['bbox'], 'spans': list(ln['spans'])}
+						prev_center_y = center_y
+						current_font = avg_font_size(ln)
+
+				paragraphs.append(current)
+
+				# Add one element per logical paragraph (each element.lines is a list of 1 item: the merged paragraph)
+				for para in paragraphs:
+					elements.append({
+						'type': 'text',
+						'bbox': bbox,
+						'y_sort': para['bbox'][1] if isinstance(para['bbox'], (list, tuple)) else bbox[1],
+						'lines': [para],
+						'indent_pt': bbox[0]
+					})
+					
         elif b['type'] == 1:  # Image
             img_bytes = b.get("image")
             ext = b.get("ext", "png")
@@ -248,8 +289,10 @@ def write_to_docx(doc, elements, page_width, page_height):
     
     # Match Page Size logic
     section = doc.sections[-1]
-    section.page_width = Pt(page_width)
-    section.page_height = Pt(page_height)
+    # page_width/page_height are PDF points (72 pt == 1 inch).
+    # Convert to inches so python-docx receives the intended size.
+    section.page_width = Inches(page_width / 72.0)
+    section.page_height = Inches(page_height / 72.0)
     
     # Reduce margins to allow PDF-like absolute positioning approximations
     # We use a small left margin and control the rest via indentation
@@ -367,10 +410,14 @@ def write_to_docx(doc, elements, page_width, page_height):
                         run.font.superscript = True
                         
                 # Add implicit space or break?
-                # If we are strictly following lines, we might add a space if the line ends
-                # but in block mode, we usually just let runs continue.
-                # However, PDF lines are distinct. Adding a space ensures words don't merge.
-                p.add_run(" ")
+				# preserve intra-span spacing: add a space at the end only when needed
+				txt = text
+				if txt and not txt.endswith(' '):
+					# peek next span text if available (to decide whether a space is needed)
+					# If there's no easy peek (complexity), it's safe to append a single space here
+					# to avoid word concatenation — the merge step above already reduces line breaks.
+					txt = txt
+				run = p.add_run(txt)
 
 # ==========================================
 # Main
