@@ -179,7 +179,7 @@ def extract_page_content(page):
         })
 
     # 2. Text & Images
-    text_blocks = page.get_text("dict")["blocks"]
+    text_blocks = page.get_text("dict", sort=True)["blocks"]
     
     for b in text_blocks:
         bbox = b['bbox']
@@ -267,7 +267,16 @@ def extract_page_content(page):
                     'ext': b.get("ext", "png")
                 })
 
-    elements.sort(key=lambda x: x['y_sort'])
+    # New Logic:
+    # 1. 'elements' currently contains tables and images (processed first).
+    # 2. Add processed text paragraphs to 'elements'.
+    # 3. Sort primarily by vertical position, BUT with a column-aware grouping 
+    #    or simply trust the "sort=True" block order if you remove the manual sort.
+    
+    # Robust Fix: Sort by vertical bands to keep columns distinct
+    # (Groups items within 50px vertical distinctness, then sorts Left-to-Right)
+    elements.sort(key=lambda e: (int(e['bbox'][1] // 10), e['bbox'][0]))
+    
     return elements
 
 # ==========================================
@@ -339,6 +348,16 @@ def write_to_docx(doc, elements, page_width, page_height):
 
         elif el['type'] == 'text':
             p = doc.add_paragraph()
+            
+            # Get full text to check for list patterns
+            full_text = "".join([s['text'] for l in el['lines'] for s in l['spans']]).strip()
+            
+            # Regex for Bullets (•, -, *) or Numbering (1., A.)
+            if re.match(r'^[\u2022\u2023\u25E6\u2043\-\*]\s+', full_text):
+                p.style = 'List Bullet'
+            elif re.match(r'^\d+\.\s+', full_text):
+                p.style = 'List Number'
+
             pf = p.paragraph_format
             raw_indent = el['indent_pt']
             relative_indent = raw_indent - margin_buffer
@@ -346,6 +365,21 @@ def write_to_docx(doc, elements, page_width, page_height):
                 pf.left_indent = Pt(relative_indent)
             pf.space_after = Pt(0)
 
+            # Heuristic: Calculate max font size in this paragraph
+            p_max_size = 0
+            for line in el['lines']:
+                for span in line['spans']:
+                    s = span.get('size', 0)
+                    if s > p_max_size: p_max_size = s
+            
+            # Assume 12pt is body text (or calculate dynamically).
+            # If text is > 2pt larger than body, treat as Heading.
+            if p_max_size >= 18:
+                p.style = 'Heading 1'
+            elif p_max_size >= 14:
+                p.style = 'Heading 2'
+            # Else remains 'Normal' (default)
+            
             for line in el['lines']:
                 spans = line['spans']
                 for si, span in enumerate(spans):
@@ -480,9 +514,13 @@ def main():
         # For multi-page, we need to ensure sections handle the breaks
         # If it's not the first page, we might need a new section for size changes
         # But for simplicity in this script, we assume uniform page sizes or just break.
+
         if i > 0:
-            doc_word.add_page_break()
-            
+            # Create a new section for this page to isolate layout/margins/size
+            doc_word.add_section()
+        
+        # Pass the specific section index or let write_to_docx handle the last section
+
         write_to_docx(doc_word, elements, page.rect.width, page.rect.height)
 
     doc_word.save(args.output)
