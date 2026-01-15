@@ -180,9 +180,21 @@ def extract_page_content(page):
 
     # 2. Text & Images
     text_blocks = page.get_text("dict", sort=True)["blocks"]
+
+    page_height = page.rect.height
+    header_threshold = page_height * 0.08  # Top 8%
+    footer_threshold = page_height * 0.92  # Bottom 8%
     
     for b in text_blocks:
         bbox = b['bbox']
+        # Identify if block is a Header/Footer
+        is_margin_content = bbox[3] < header_threshold or bbox[1] > footer_threshold
+        
+        # Optional: Skip common artifacts like single-digit page numbers in margins
+        if is_margin_content and len(b.get("lines", [])) == 1:
+            if re.match(r'^\d+$', page.get_text("text", clip=bbox).strip()):
+                continue
+            
         if any(is_box_inside(bbox, tr) for tr in table_rects):
             continue
 
@@ -226,7 +238,9 @@ def extract_page_content(page):
                     rel_gap_factor = 0.45  # fraction of font size to accept as same-line
                     threshold = max(min_gap_pts, rel_gap_factor * current_font)
 
-                    if gap <= threshold:
+                    # Check vertical gap AND horizontal alignment (left margin)
+                    x_offset = abs(ln['bbox'][0] - current['bbox'][0])
+                    if gap <= threshold and x_offset < 10:
                         last_span = current['spans'][-1]
                         if last_span['text'].rstrip().endswith('-') and len(last_span['text'].strip()) > 1:
                             last_span['text'] = last_span['text'].rstrip().rstrip('-')
@@ -267,6 +281,24 @@ def extract_page_content(page):
                     'ext': b.get("ext", "png")
                 })
 
+    # Detect logical columns based on the distribution of x0 coordinates
+    x_coords = sorted([el['bbox'][0] for el in elements])
+    columns = [0]
+    if x_coords:
+        for i in range(1, len(x_coords)):
+            # If there's a gap of more than 15% of page width, mark a new column
+            if x_coords[i] - x_coords[i-1] > (page.rect.width * 0.15):
+                columns.append(x_coords[i]
+                               
+    # Sort elements primarily by column (x-coordinate), then by row (y-coordinate)
+    # This ensures that in multi-column layouts, the left column is read fully before the right.
+    def get_reading_order(el):
+        bbox = el['bbox']
+        # Assign to the closest detected column start
+        col_idx = sum(1 for c in columns if bbox[0] >= c)
+        # Sort by column, then vertical, then horizontal
+        return (col_idx, bbox[1], bbox[0])
+    
     # New Logic:
     # 1. 'elements' currently contains tables and images (processed first).
     # 2. Add processed text paragraphs to 'elements'.
@@ -275,7 +307,7 @@ def extract_page_content(page):
     
     # Robust Fix: Sort by vertical bands to keep columns distinct
     # (Groups items within 50px vertical distinctness, then sorts Left-to-Right)
-    elements.sort(key=lambda e: (int(e['bbox'][1] // 10), e['bbox'][0]))
+    elements.sort(key=get_reading_order)
     
     return elements
 
@@ -312,12 +344,19 @@ def write_to_docx(doc, elements, page_width, page_height):
             table.style = 'Table Grid'
             
             for r, row_data in enumerate(data):
+                row_cells = table.rows[r].cells
                 for c, cell_text in enumerate(row_data):
-                    if c < len(table.rows[r].cells):
-                        cell = table.rows[r].cells[c]
-                        # Clean None values
-                        t_val = cell_text if cell_text else ""
-                        cell.text = t_val.strip()
+                    if c >= len(row_cells): break
+                    cell = row_cells[c]
+                    t_val = (cell_text or "").strip()
+                    
+                    # Create a run to allow formatting
+                    p = cell.paragraphs[0]
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER if r == 0 else WD_ALIGN_PARAGRAPH.LEFT
+                    run = p.add_run(t_val)
+                    if r == 0: # Bold headers
+                        run.bold = True
+                        cell.shading.background_pattern_color = "EDEDED"
             
             doc.add_paragraph() # spacer
 
@@ -372,13 +411,19 @@ def write_to_docx(doc, elements, page_width, page_height):
                     s = span.get('size', 0)
                     if s > p_max_size: p_max_size = s
             
-            # Assume 12pt is body text (or calculate dynamically).
-            # If text is > 2pt larger than body, treat as Heading.
-            if p_max_size >= 18:
+            # Enhanced: Use size + bold flags for semantic hierarchy
+            is_mostly_bold = any(bool(s.get('flags', 0) & 16) for l in el['lines'] for s in l['spans'])
+            
+            # Calculate base size from all text elements to find "Normal"
+            all_sizes = [s.get('size', 12) for el in elements if el['type'] == 'text' for ln in el['lines'] for s in ln['spans']]
+            base_size = max(all_sizes, key=all_sizes.count) if all_sizes else 12
+
+            if p_max_size > base_size + 4:
                 p.style = 'Heading 1'
-            elif p_max_size >= 14:
+            elif p_max_size > base_size + 1:
                 p.style = 'Heading 2'
-            # Else remains 'Normal' (default)
+            elif is_mostly_bold:
+                p.style = 'Heading 3'
             
             for line in el['lines']:
                 spans = line['spans']
