@@ -106,17 +106,37 @@ def add_hyperlink(paragraph, url, text, color, is_bold, is_italic, font_name, fo
     run = OxmlElement('w:r')
     rPr = OxmlElement('w:rPr')
 
-    # Color (usually blue for links, but we use source color)
+    # Color (use source color)
     c_el = OxmlElement('w:color')
     c_el.set(qn('w:val'), "{:02x}{:02x}{:02x}".format(*color))
     rPr.append(c_el)
 
-    # Underline (standard for links)
+    # Underline
     u_el = OxmlElement('w:u')
     u_el.set(qn('w:val'), 'single')
     rPr.append(u_el)
 
-    # Fonts/Style
+    # Font family (rFonts) so Word renders link in intended face
+    if font_name:
+        rfonts = OxmlElement('w:rFonts')
+        rfonts.set(qn('w:ascii'), font_name)
+        rfonts.set(qn('w:hAnsi'), font_name)
+        rfonts.set(qn('w:eastAsia'), font_name)
+        rPr.append(rfonts)
+
+    # Font size (size is in half-points in docx XML)
+    try:
+        if font_size:
+            sz = OxmlElement('w:sz')
+            sz.set(qn('w:val'), str(int(float(font_size) * 2)))
+            rPr.append(sz)
+            szCs = OxmlElement('w:szCs')
+            szCs.set(qn('w:val'), str(int(float(font_size) * 2)))
+            rPr.append(szCs)
+    except Exception:
+        pass
+
+    # Bold/Italic
     if is_bold:
         rPr.append(OxmlElement('w:b'))
     if is_italic:
@@ -320,22 +340,11 @@ def extract_page_content(page):
                 })
 
     # Detect logical columns based on the distribution of x0 coordinates
-    # Cluster the left x-coordinate (bbox[0]) into logical columns using a greedy
-    # distance-based clustering. This is more robust across small offsets.
-    x_vals = sorted([el['bbox'][0] for el in elements])
-    columns = []
-    if x_vals:
-        # distance threshold uses a fraction of page width (10%) but also a small absolute min
-        dist_thresh = max(page.rect.width * 0.10, 24)  # 24pt floor
-        current_cluster = [x_vals[0]]
-        for xv in x_vals[1:]:
-            if xv - current_cluster[-1] <= dist_thresh:
-                current_cluster.append(xv)
-            else:
-                columns.append(sum(current_cluster) / len(current_cluster))
-                current_cluster = [xv]
-        if current_cluster:
-            columns.append(sum(current_cluster) / len(current_cluster))
+    # --- Replace local clustering with centralized function -----------------
+    # Build a lightweight 'spans' list (each item has a bbox) compatible
+    # with analyze_columns_simple(spans, page_width)
+    spans_for_columns = [{'bbox': el['bbox']} for el in elements if el.get('bbox')]
+    columns = analyze_columns_simple(spans_for_columns, page.rect.width)
 
     # assign each element to the nearest column center, then sort by (col, y, x)
     def get_column_index(x0):
@@ -358,6 +367,31 @@ def extract_page_content(page):
         # then left-to-right.
         return (col_idx, float(by0), -float(height), float(bx0))
 
+    # --- Attach short centered text blocks immediately below images as captions ---
+    # Approx: if a text block's top is within ~18pt below an image bottom and its width is
+    # similar to the image, consider it a caption.
+    new_elements = list(elements)  # shallow copy for mutation
+    image_elements = [el for el in elements if el['type'] == 'image']
+    for img in image_elements:
+        ix0, iy0, ix1, iy1 = img['bbox']
+        img_mid_x = (ix0 + ix1) / 2.0
+        img_w = ix1 - ix0
+        for txt in elements:
+            if txt is img or txt.get('type') != 'text':
+                continue
+            tx0, ty0, tx1, ty1 = txt['bbox']
+            # top of text just below image bottom (within 3-20pt)
+            vdist = ty0 - iy1
+            # roughly centered and width similar (caption often narrower)
+            h_center_diff = abs(((tx0 + tx1) / 2.0) - img_mid_x)
+            if 0 <= vdist <= 20 and h_center_diff <= max(12, img_w * 0.2):
+                # attach as caption
+                img.setdefault('captions', []).append(txt)
+                if txt in new_elements:
+                    new_elements.remove(txt)
+                break
+    elements = new_elements
+    
     elements.sort(key=get_reading_order)
     
     return elements
@@ -383,6 +417,21 @@ def write_to_docx(doc, elements, page_width, page_height):
     section.top_margin = Pt(margin_buffer)
     section.bottom_margin = Pt(margin_buffer)
 
+    # --- Compute page-wide base font size once for stable heading detection ---
+    all_sizes = []
+    for e in elements:
+        if e.get('type') != 'text':
+            continue
+        for ln in e.get('lines', []):
+            for s in ln.get('spans', []):
+                if s.get('size'):
+                    all_sizes.append(float(s.get('size')))
+    if all_sizes:
+        # median is robust to noise (very small/very large fonts in captions)
+        base_size = float(statistics.median(all_sizes))
+    else:
+        base_size = 12.0
+        
     for el in elements:
         
         if el['type'] == 'table':
@@ -441,25 +490,85 @@ def write_to_docx(doc, elements, page_width, page_height):
         elif el['type'] == 'image':
             img_stream = io.BytesIO(el['bytes'])
             try:
+                # Ensure stream position is at start
+                try:
+                    img_stream.seek(0)
+                except Exception:
+                    pass
+
                 # Calculate width in inches based on PDF points (1/72 inch)
-                # Cap it at page width - margins
                 img_w_pts = el['bbox'][2] - el['bbox'][0]
                 img_w_inches = img_w_pts / 72.0
-                
-                doc.add_picture(img_stream, width=Inches(img_w_inches))
+
+                # Cap to printable area (page width minus left/right margins).
+                # Ensure margin_buffer is expressed in points (same units as page_width).
+                printable_width_pts = max(36.0, page_width - (margin_buffer * 2))  # at least 0.5 in (36pt)
+                max_img_width_in = printable_width_pts / 72.0
+                img_w_inches = min(img_w_inches, max_img_width_in)
+
+                try:
+                    doc.add_picture(img_stream, width=Inches(img_w_inches))
+                except Exception:
+                    # fallback: add without width, let python-docx handle it
+                    img_stream.seek(0)
+                    doc.add_picture(img_stream)
+                # paragraph containing the picture is usually the last paragraph
                 last_p = doc.paragraphs[-1]
-                
-                # Try to approximate alignment
-                page_mid = page_width / 2
-                img_mid = (el['bbox'][0] + el['bbox'][2]) / 2
-                
+
+                # approximate alignment using bbox centers (unit: points)
+                page_mid = page_width / 2.0
+                img_mid = (el['bbox'][0] + el['bbox'][2]) / 2.0
+
+                # threshold 20pt is fine; adjust if needed
                 if abs(img_mid - page_mid) < 20:
                     last_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 elif img_mid > page_mid:
                     last_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
                 else:
                     last_p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    
+
+                # After adding picture and alignment: attach captions if present
+                if el.get('captions'):
+                    for cap in el.get('captions'):
+                        cap_text = "".join([s['text'] for l in cap.get('lines', []) for s in l.get('spans', [])]).strip()
+                        if not cap_text:
+                            continue
+
+                        cap_p = doc.add_paragraph(cap_text)
+                        cap_p.alignment = last_p.alignment
+
+                        # Use 'Caption' style if available, otherwise keep default
+                        caption_style_name = 'Caption'
+                        if caption_style_name in (s.name for s in doc.styles):
+                            try:
+                                cap_p.style = caption_style_name
+                            except Exception:
+                                pass
+
+                        # Try to derive a sensible font size from the caption spans
+                        cap_font_size_pt = None
+                        try:
+                            first_line = cap.get('lines', [])[0]
+                            first_span = first_line.get('spans', [])[0]
+                            if first_span and first_span.get('size'):
+                                cap_font_size_pt = float(first_span.get('size'))
+                        except Exception:
+                            cap_font_size_pt = None
+
+                        if cap_font_size_pt is None:
+                            cap_font_size_pt = 10.0  # fallback
+
+                        # safe run update
+                        try:
+                            if cap_p.runs:
+                                cap_p.runs[0].italic = True
+                                cap_p.runs[0].font.size = Pt(max(8.0, cap_font_size_pt))
+                            # spacing tweaks
+                            cap_p.paragraph_format.space_before = Pt(2)
+                            cap_p.paragraph_format.space_after = Pt(6)
+                        except Exception:
+                            pass
+
             except Exception as e:
                 print(f"Warning: Image skipped: {e}")
 
@@ -470,25 +579,37 @@ def write_to_docx(doc, elements, page_width, page_height):
             full_text = "".join([s['text'] for l in el['lines'] for s in l['spans']]).strip()
             pf = p.paragraph_format
 
-            # Compute indentation relative to page margin (once)
             raw_indent = el.get('indent_pt', 0) or 0
             relative_indent = max(0.0, raw_indent - margin_buffer)
 
-            # Determine list tokens AFTER indent is known - list detection uses text & indent
             bullet_re = r'^([\u2022\u2023\u25E6\u2043\u27A2\-\*])\s+'
             numbered_re = r'^(\d+(\.\d+)*|[A-Za-z]\.)\s+'
 
-            level = int(relative_indent // 18)  # each ~18pt -> one nested level
+            level = int(relative_indent // 18)
+
+            # If list token exists, remove it from the first span's text so Word doesn't
+            # render both the literal token and the automatic list glyph.
+            is_list = False
             if re.match(bullet_re, full_text):
                 p.style = 'List Bullet'
-                # set left indent to margin + nesting
                 pf.left_indent = Pt(level * 18)
+                is_list = True
             elif re.match(numbered_re, full_text):
                 p.style = 'List Number'
                 pf.left_indent = Pt(level * 18)
+                is_list = True
             else:
-                # regular paragraph: set left indent proportional to relative_indent
                 pf.left_indent = Pt(relative_indent)
+
+            if is_list:
+                # remove token only from the very first text run (preserving other runs)
+                try:
+                    first_line = el['lines'][0]
+                    first_span = first_line['spans'][0]
+                    first_span['text'] = re.sub(bullet_re, '', first_span['text'], count=1)
+                    first_span['text'] = re.sub(numbered_re, '', first_span['text'], count=1)
+                except Exception:
+                    pass
 
             # For nested lists, optionally set hanging indent for readability
             if p.style.name in ('List Bullet', 'List Number'):
