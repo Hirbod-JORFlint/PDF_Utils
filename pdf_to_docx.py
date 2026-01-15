@@ -28,8 +28,11 @@ import fitz  # PyMuPDF
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.section import WD_SECTION
+from docx.oxml.shared import OxmlElement, qn as _qn
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+import statistics
 
 # ==========================================
 # Helpers
@@ -154,13 +157,31 @@ def get_link_target(bbox, links):
 
 def analyze_columns_simple(spans, page_width):
     """
-    Simple heuristic to detect if text belongs to left or right column
-    to calculate indentation correctly.
+    Greedy clustering of left x-coordinates to detect logical column centers.
+    Returns a list of column center x-coordinates (in PDF points).
+    Uses a distance threshold relative to page width (10%) with a small absolute floor.
     """
-    mid = page_width / 2
-    # Simple cluster check: how many spans are strictly left vs strictly right?
-    # This is a basic check.
-    return [(0, page_width)] 
+    if not spans:
+        return [page_width / 2.0]
+
+    x_vals = sorted([s['bbox'][0] for s in spans if s.get('bbox')])
+    dist_thresh = max(page_width * 0.10, 24)  # 10% of page or 24pt floor
+    columns = []
+    current_cluster = [x_vals[0]]
+
+    for xv in x_vals[1:]:
+        if xv - current_cluster[-1] <= dist_thresh:
+            current_cluster.append(xv)
+        else:
+            columns.append(sum(current_cluster) / len(current_cluster))
+            current_cluster = [xv]
+    if current_cluster:
+        columns.append(sum(current_cluster) / len(current_cluster))
+
+    # If clustering collapsed to a single column, return center of page for robustness
+    if len(columns) == 1:
+        return columns
+    return columns
 
 def extract_page_content(page):
     elements = []
@@ -228,20 +249,32 @@ def extract_page_content(page):
                 prev_center_y = (para_lines[0]['bbox'][1] + para_lines[0]['bbox'][3]) / 2.0
                 current_font = avg_font_size(para_lines[0])
 
-                for ln in para_lines[1:]:
-                    center_y = (ln['bbox'][1] + ln['bbox'][3]) / 2.0
-                    gap = abs(center_y - prev_center_y)
-                    # previous: threshold = max(6.0, 0.75 * current_font)
-                    # Improved: use both an absolute minimum and a fraction of the font size,
-                    # but use the actual bbox vertical gap to decide. This reduces accidental merges.
-                    # current_font is in points.
-                    min_gap_pts = 3.0  # don't treat sub-3pt differences as same-line
-                    rel_gap_factor = 0.45  # fraction of font size to accept as same-line
-                    threshold = max(min_gap_pts, rel_gap_factor * current_font)
+                def representative_font_size(line):
+                    sizes = [s.get('size') for s in line['spans'] if s.get('size')]
+                    if not sizes:
+                        return 12.0
+                    # use median (robust to outliers)
+                    return float(statistics.median(sizes))
+                
+                current_font = representative_font_size(para_lines[0])
+                prev_bottom = para_lines[0]['bbox'][3]  # y1 of previous bbox
 
-                    # Check vertical gap AND horizontal alignment (left margin)
+                for ln in para_lines[1:]:
+                    top = ln['bbox'][1]
+                    # vertical gap: distance from previous bottom to this top (PDF coords)
+                    gap_pts = max(0.0, top - prev_bottom)
+                    ln_font = representative_font_size(ln)
+
+                    # threshold: small absolute minimum + fraction of larger font size for robustness
+                    min_gap_pts = 3.0
+                    rel_gap_factor = 0.45
+                    threshold = max(min_gap_pts, rel_gap_factor * max(current_font, ln_font))
+
+                    # horizontal alignment: left indent difference
                     x_offset = abs(ln['bbox'][0] - current['bbox'][0])
-                    if gap <= threshold and x_offset < 10:
+
+                    if gap_pts <= threshold and x_offset < 12:
+                        # same paragraph: merge. handle hyphenation across lines
                         last_span = current['spans'][-1]
                         if last_span['text'].rstrip().endswith('-') and len(last_span['text'].strip()) > 1:
                             last_span['text'] = last_span['text'].rstrip().rstrip('-')
@@ -249,16 +282,20 @@ def extract_page_content(page):
                             if not last_span['text'].endswith(' '):
                                 last_span['text'] += ' '
                         current['spans'].extend(ln['spans'])
+                        # expand bbox
                         c = list(current['bbox'])
                         c[2] = max(c[2], ln['bbox'][2])
                         c[3] = max(c[3], ln['bbox'][3])
                         current['bbox'] = tuple(c)
-                        prev_center_y = center_y
+                        prev_bottom = current['bbox'][3]
+                        # keep current_font as a representative (max of values to avoid shrink)
+                        current_font = max(current_font, ln_font)
                     else:
+                        # new paragraph
                         paragraphs.append(current)
                         current = {'bbox': ln['bbox'], 'spans': list(ln['spans'])}
-                        prev_center_y = center_y
-                        current_font = avg_font_size(ln)
+                        prev_bottom = current['bbox'][3]
+                        current_font = ln_font
 
                 paragraphs.append(current)
 
@@ -315,9 +352,11 @@ def extract_page_content(page):
 
     def get_reading_order(el):
         bx0, by0, bx1, by1 = el['bbox']
+        height = max(0.0, by1 - by0)
         col_idx = get_column_index(bx0)
-        # within a column, sort top-to-bottom, then left-to-right for ties
-        return (col_idx, round(by0, 1), round(bx0, 1))
+        # within a column, sort top-to-bottom (use by0), prefer taller blocks earlier for tie-breaks,
+        # then left-to-right.
+        return (col_idx, float(by0), -float(height), float(bx0))
 
     elements.sort(key=get_reading_order)
     
@@ -354,21 +393,29 @@ def write_to_docx(doc, elements, page_width, page_height):
             cols = len(data[0])
             table = doc.add_table(rows=rows, cols=cols)
             table.style = 'Table Grid'
-            table.autofit = False 
-            # Calculate proportional widths from the PDF bbox
-            total_pts = el['bbox'][2] - el['bbox'][0]
-            col_width = Inches((total_pts / 72.0) / cols)
-            for column in table.columns:
-                column.width = col_width
-            
+            # Better: prevent autofit then set explicit widths
+            try:
+                table.allow_autofit = False
+            except Exception:
+                try:
+                    table.autofit = False
+                except Exception:
+                    pass
 
-            # set column widths (proportional to table bbox)
-            total_pts = el['bbox'][2] - el['bbox'][0]
-            # compute width in inches once
-            total_in = (total_pts / 72.0) if total_pts > 0 else (page_width / 72.0)
-            col_width_in = total_in / cols
-            for ci, column in enumerate(table.columns):
-                column.width = Inches(col_width_in)
+            total_pts = max(1.0, el['bbox'][2] - el['bbox'][0])
+            total_in = total_pts / 72.0
+            col_width_in = total_in / max(1, cols)
+
+            # Apply width to each column's cells via tcPr/w attributes for more reliable layout
+            for r_idx in range(rows):
+                row_cells = table.rows[r_idx].cells
+                for c_idx, cell in enumerate(row_cells):
+                    tc = cell._tc
+                    tcPr = tc.get_or_add_tcPr()
+                    tcW = OxmlElement('w:tcW')
+                    tcW.set(_qn('w:w'), str(int(col_width_in * 1440)))  # twips
+                    tcW.set(_qn('w:type'), 'dxa')
+                    tcPr.append(tcW)
 
             for r, row_data in enumerate(data):
                 row_cells = table.rows[r].cells
@@ -423,31 +470,33 @@ def write_to_docx(doc, elements, page_width, page_height):
             full_text = "".join([s['text'] for l in el['lines'] for s in l['spans']]).strip()
             pf = p.paragraph_format
 
-            # Detect bullet/number start tokens
+            # Compute indentation relative to page margin (once)
+            raw_indent = el.get('indent_pt', 0) or 0
+            relative_indent = max(0.0, raw_indent - margin_buffer)
+
+            # Determine list tokens AFTER indent is known - list detection uses text & indent
             bullet_re = r'^([\u2022\u2023\u25E6\u2043\u27A2\-\*])\s+'
             numbered_re = r'^(\d+(\.\d+)*|[A-Za-z]\.)\s+'
 
+            level = int(relative_indent // 18)  # each ~18pt -> one nested level
             if re.match(bullet_re, full_text):
                 p.style = 'List Bullet'
-                pf.left_indent = Pt(0)
+                # set left indent to margin + nesting
+                pf.left_indent = Pt(level * 18)
             elif re.match(numbered_re, full_text):
                 p.style = 'List Number'
-                pf.left_indent = Pt(0)
+                pf.left_indent = Pt(level * 18)
+            else:
+                # regular paragraph: set left indent proportional to relative_indent
+                pf.left_indent = Pt(relative_indent)
 
-            # Nested lists: apply additional left_indent proportional to relative_indent
-            # relative_indent earlier computed as max(0, raw_indent - margin_buffer)
-            try:
-                if 'relative_indent' in locals():
-                    # compute level (integer) by dividing indent by typical tab width (18pt)
-                    level = int(max(0, relative_indent) // 18)
-                    pf.left_indent = Pt(level * 18)
-            except Exception:
-                pass
-            
-            # Indentation
-            raw_indent = el['indent_pt']
-            relative_indent = max(0, raw_indent - margin_buffer)
-            pf.left_indent = Pt(relative_indent)
+            # For nested lists, optionally set hanging indent for readability
+            if p.style.name in ('List Bullet', 'List Number'):
+                # hanging indent: keep bullet/number flush then text indented
+                pf.first_line_indent = Pt(-12)  # negative to create hanging indent
+                # Ensure a minimal left indent so bullets don't overlap margin
+                if pf.left_indent and pf.left_indent.pt < 12:
+                    pf.left_indent = Pt(12 + level * 12)
             
             # Smart spacing: larger gap for headings, standard gap for body text
             if p.style.name.startswith('Heading') or p.style.name == 'Title':
@@ -616,8 +665,8 @@ def main():
         # But for simplicity in this script, we assume uniform page sizes or just break.
 
         if i > 0:
-            # Create a new section for this page to isolate layout/margins/size
-            doc_word.add_section()
+            # Create a new section (force new page) so we can set page size/margins per PDF page
+            doc_word.add_section(WD_SECTION.NEW_PAGE)
         
         # Pass the specific section index or let write_to_docx handle the last section
 
