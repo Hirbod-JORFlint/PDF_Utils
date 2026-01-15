@@ -213,8 +213,23 @@ def analyze_columns_simple(spans, page_width):
     if current:
         columns.append(sum(current) / len(current))
 
-    # if we collapsed into a single column, return that center (no forced center override)
-    return columns if len(columns) > 1 else columns
+    # merge close column centers to avoid micro-columns
+    merged = []
+    merge_thresh = max(page_width * 0.03, 18)  # 3% of page or 18pt floor
+    for c in columns:
+        if not merged:
+            merged.append(c)
+        else:
+            if abs(c - merged[-1]) <= merge_thresh:
+                # average into last
+                merged[-1] = (merged[-1] + c) / 2.0
+            else:
+                merged.append(c)
+
+    # Ensure at least one center (fallback to page middle)
+    if not merged:
+        return [page_width / 2.0]
+    return merged
 
 def extract_page_content(page):
     elements = []
@@ -413,9 +428,26 @@ def extract_page_content(page):
 
             # require shortish caption and modest font size
             cap_text = "".join([s['text'] for l in txt.get('lines', []) for s in l.get('spans', [])]).strip()
-            if not cap_text or len(cap_text) > img_w * 0.8:  # very long text unlikely to be caption
+            if not cap_text:
                 continue
+            # estimate average char width (pts). Try to read first span size to estimate; fallback to 6.0 pts
+            est_font_pt = None
+            try:
+                first_line = txt.get('lines', [])[0]
+                first_span = first_line.get('spans', [])[0]
+                if first_span and first_span.get('size'):
+                    est_font_pt = float(first_span.get('size'))
+            except Exception:
+                est_font_pt = None
+            if not est_font_pt:
+                est_font_pt = 6.0
 
+            # conservative char width estimate: about 0.5 * font_pt (typical for proportional fonts)
+            char_width_pts = max(2.5, 0.45 * est_font_pt)
+            max_chars = int((img_w * 0.8) / char_width_pts)
+            # reject overly long text relative to image width
+            if len(cap_text) > max_chars:
+                continue
             if 0 <= vdist <= max_vdist and h_center_diff <= max_h_center:
                 img.setdefault('captions', []).append(txt)
                 consumed_text_ids.add(id(txt))
@@ -494,14 +526,19 @@ def write_to_docx(doc, elements, page_width, page_height):
             col_width_in = total_in / float(cols)
 
             # set cell widths via tcPr (keeps prior approach)
+            # --- set column widths deterministically (twips) ---
+            col_twips = int(col_width_in * 1440)
             for r_idx in range(rows):
-                row_cells = table.rows[r_idx].cells
                 for c_idx in range(cols):
-                    cell = row_cells[c_idx]
+                    cell = table.rows[r_idx].cells[c_idx]
                     tc = cell._tc
                     tcPr = tc.get_or_add_tcPr()
+                    # remove any existing tcW children to avoid duplicates
+                    for child in list(tcPr):
+                        if child.tag.endswith('tcW'):
+                            tcPr.remove(child)
                     tcW = OxmlElement('w:tcW')
-                    tcW.set(_qn('w:w'), str(int(col_width_in * 1440)))  # twips
+                    tcW.set(_qn('w:w'), str(col_twips))
                     tcW.set(_qn('w:type'), 'dxa')
                     tcPr.append(tcW)
 
@@ -624,30 +661,38 @@ def write_to_docx(doc, elements, page_width, page_height):
 
             bullet_re = r'^([\u2022\u2023\u25E6\u2043\u27A2\-\*])\s+'
             numbered_re = r'^(\d+(\.\d+)*|[A-Za-z]\.)\s+'
-            level = int(relative_indent // 18)
+            # derive level more robustly (round rather than floor), avoid negative
+            level = max(0, int(round(relative_indent / 18.0)))
 
-            is_list = False
             found_bullet = re.match(bullet_re, full_text)
             found_number = re.match(numbered_re, full_text)
+            is_list = bool(found_bullet or found_number)
 
-            if found_bullet or found_number:
-                is_list = True
+            if is_list:
                 target_style = 'List Bullet' if found_bullet else 'List Number'
+                # Prefer built-in styles if available
                 if target_style in (s.name for s in doc.styles):
                     try:
                         p.style = target_style
-                        pf.left_indent = Pt(level * 18)
+                        pf.left_indent = Pt(12 + level * 18)
                     except Exception:
-                        pf.left_indent = Pt(level * 18)
+                        pf.left_indent = Pt(12 + level * 18)
                 else:
-                    # Emulate list: set hanging indent and insert a bullet glyph run
-                    pf.left_indent = Pt(12 + level * 12)
+                    # Emulate list: remove leading glyph from the text that will be added below
+                    glyph_text = found_bullet.group(1) if found_bullet else (found_number.group(1) + '.')
+                    # remove glyph from first span if present
+                    first_line = el['lines'][0]
+                    first_span = first_line['spans'][0]
+                    if first_span and first_span.get('text', '').lstrip().startswith(glyph_text):
+                        # strip the glyph from the span's text so the glyph is not duplicated
+                        first_span['text'] = re.sub(r'^\s*' + re.escape(glyph_text) + r'\s*', '', first_span['text'], count=1)
+
+                    # set hanging indent
+                    pf.left_indent = Pt(18 + level * 18)
                     pf.first_line_indent = Pt(-12)
-                    # Insert bullet glyph as first run instead of mutating el structure
-                    glyph = found_bullet.group(1) if found_bullet else (found_number.group(1) + '.')
-                    run = p.add_run(glyph + ' ')
-                    run.bold = False
-                    # After adding glyph, continue to add actual spans below (we will not mutates spans here)
+                    # Insert visible glyph run (so Word-like bullet appears)
+                    glyph_run = p.add_run((glyph_text if found_bullet else '') + ' ')
+                    glyph_run.bold = False
 
             # For nested lists, optionally set hanging indent for readability
             if p.style.name in ('List Bullet', 'List Number'):
@@ -665,29 +710,47 @@ def write_to_docx(doc, elements, page_width, page_height):
                 pf.space_after = Pt(8) # Standard paragraph spacing
 
             # Heuristic: Calculate max font size in this paragraph
-            p_max_size = 0
-            for line in el['lines']:
-                for span in line['spans']:
-                    s = span.get('size', 0)
-                    if s > p_max_size: p_max_size = s
-            
-            # Enhanced: Use size + bold flags for semantic hierarchy
-            # Use the document-level base size (computed once above) for stable comparisons.
             doc_base_size = base_size  # already computed earlier in write_to_docx
+            def paragraph_median_size(par_lines):
+                sizes = [s.get('size') for l in par_lines for s in l.get('spans', []) if s.get('size')]
+                return float(statistics.median(sizes)) if sizes else float(doc_base_size)
 
-            is_mostly_bold = any(bool(s.get('flags', 0) & 16) for l in el['lines'] for s in l['spans'])
-            scale = (p_max_size / float(doc_base_size)) if doc_base_size else 1.0
+            p_median_size = paragraph_median_size(el['lines'])
+            # proportion of spans that are bold
+            all_spans = [s for l in el['lines'] for s in l.get('spans', [])]
+            bold_spans = [s for s in all_spans if bool(s.get('flags', 0) & 16)]
+            bold_prop = (len(bold_spans) / len(all_spans)) if all_spans else 0.0
 
-            # Prefer Title, H1, H2, H3 using relative scale thresholds.
+            # Use both a relative multiplier and absolute pt delta to avoid tiny-font artifacts.
+            rel_mul = p_median_size / float(doc_base_size) if doc_base_size else 1.0
+            abs_delta = p_median_size - float(doc_base_size)
+
             heading_style = None
-            if scale >= 1.8:
-                heading_style = 'Title' if 'Title' in (s.name for s in doc.styles) else 'Heading 1'
-            elif scale >= 1.35:
-                heading_style = 'Heading 1' if 'Heading 1' in (s.name for s in doc.styles) else None
-            elif scale >= 1.15:
-                heading_style = 'Heading 2' if 'Heading 2' in (s.name for s in doc.styles) else None
-            elif is_mostly_bold and scale >= 1.0:
-                heading_style = 'Heading 3' if 'Heading 3' in (s.name for s in doc.styles) else None
+            styles_available = {s.name for s in doc.styles}
+
+            # Rules (ordered):
+            #  - Very large text -> Title / H1
+            #  - Moderately large + boldness -> H1 / H2
+            #  - Slightly larger + bold -> H2/H3
+            if rel_mul >= 1.9 or p_median_size >= (doc_base_size + 8):
+                heading_style = 'Title' if 'Title' in styles_available else ('Heading 1' if 'Heading 1' in styles_available else None)
+            elif rel_mul >= 1.45 or p_median_size >= (doc_base_size + 4):
+                heading_style = 'Heading 1' if 'Heading 1' in styles_available else ('Heading 2' if 'Heading 2' in styles_available else None)
+            elif rel_mul >= 1.20 or (abs_delta >= 2 and bold_prop >= 0.35):
+                heading_style = 'Heading 2' if 'Heading 2' in styles_available else ('Heading 3' if 'Heading 3' in styles_available else None)
+            elif bold_prop >= 0.5 and rel_mul >= 1.05:
+                heading_style = 'Heading 3' if 'Heading 3' in styles_available else None
+
+            # If we picked a heading, apply style and modest spacing
+            if heading_style:
+                try:
+                    p.style = heading_style
+                    pf.space_before = Pt(10)
+                    pf.space_after = Pt(6)
+                    p.paragraph_format.keep_with_next = True
+                except Exception:
+                    pf.space_before = Pt(10)
+                    pf.space_after = Pt(6)
 
             if heading_style:
                 try:
