@@ -284,20 +284,25 @@ def extract_page_content(page):
     # Detect logical columns based on the distribution of x0 coordinates
     x_coords = sorted([el['bbox'][0] for el in elements])
     columns = [0]
+    # Detect logical columns based on the distribution of x0 coordinates
+    # Filter out very small overlaps and group x-coordinates into clusters
     if x_coords:
+        # Use a 10% page width threshold to identify distinct column starts
+        col_threshold = page.rect.width * 0.10
         for i in range(1, len(x_coords)):
-            # If there's a gap of more than 15% of page width, mark a new column
-            if x_coords[i] - x_coords[i-1] > (page.rect.width * 0.15):
-                columns.append(x_coords[i]
-                               
+            if x_coords[i] - columns[-1] > col_threshold:
+                columns.append(x_coords[i])                           
     # Sort elements primarily by column (x-coordinate), then by row (y-coordinate)
     # This ensures that in multi-column layouts, the left column is read fully before the right.
     def get_reading_order(el):
         bbox = el['bbox']
-        # Assign to the closest detected column start
-        col_idx = sum(1 for c in columns if bbox[0] >= c)
-        # Sort by column, then vertical, then horizontal
-        return (col_idx, bbox[1], bbox[0])
+        # Snap x-coordinate to the nearest column start to handle slight misalignments
+        col_idx = 0
+        for idx, col_start in enumerate(columns):
+            if bbox[0] >= col_start - 5: # 5pt tolerance
+                col_idx = idx
+        # Sort by Column first, then Y (top-to-bottom), then X (left-to-right)
+        return (col_idx, round(bbox[1], 1), round(bbox[0], 1))
     
     # New Logic:
     # 1. 'elements' currently contains tables and images (processed first).
@@ -342,6 +347,12 @@ def write_to_docx(doc, elements, page_width, page_height):
             cols = len(data[0])
             table = doc.add_table(rows=rows, cols=cols)
             table.style = 'Table Grid'
+            table.autofit = False 
+            # Calculate proportional widths from the PDF bbox
+            total_pts = el['bbox'][2] - el['bbox'][0]
+            col_width = Inches((total_pts / 72.0) / cols)
+            for column in table.columns:
+                column.width = col_width
             
             for r, row_data in enumerate(data):
                 row_cells = table.rows[r].cells
@@ -390,19 +401,27 @@ def write_to_docx(doc, elements, page_width, page_height):
             
             # Get full text to check for list patterns
             full_text = "".join([s['text'] for l in el['lines'] for s in l['spans']]).strip()
-            
-            # Regex for Bullets (•, -, *) or Numbering (1., A.)
-            if re.match(r'^[\u2022\u2023\u25E6\u2043\-\*]\s+', full_text):
-                p.style = 'List Bullet'
-            elif re.match(r'^\d+\.\s+', full_text):
-                p.style = 'List Number'
 
+            # Expanded regex for nested numbers (1.1) and varied bullet glyphs
+            if re.match(r'^([\u2022\u2023\u25E6\u2043\u27A2\-\*])\s+', full_text):
+                p.style = 'List Bullet'
+                pf.left_indent = Pt(0) # Let Word style handle the bullet indent
+            elif re.match(r'^(\d+(\.\d+)*|[A-Za-z]\.)\s+', full_text):
+                p.style = 'List Number'
+                pf.left_indent = Pt(0)
+    
             pf = p.paragraph_format
+            # Indentation
             raw_indent = el['indent_pt']
-            relative_indent = raw_indent - margin_buffer
-            if relative_indent > 0:
-                pf.left_indent = Pt(relative_indent)
-            pf.space_after = Pt(0)
+            relative_indent = max(0, raw_indent - margin_buffer)
+            pf.left_indent = Pt(relative_indent)
+            
+            # Smart spacing: larger gap for headings, standard gap for body text
+            if p.style.name.startswith('Heading') or p.style.name == 'Title':
+                pf.space_before = Pt(12)
+                pf.space_after = Pt(6)
+            else:
+                pf.space_after = Pt(8) # Standard paragraph spacing
 
             # Heuristic: Calculate max font size in this paragraph
             p_max_size = 0
@@ -418,11 +437,14 @@ def write_to_docx(doc, elements, page_width, page_height):
             all_sizes = [s.get('size', 12) for el in elements if el['type'] == 'text' for ln in el['lines'] for s in ln['spans']]
             base_size = max(all_sizes, key=all_sizes.count) if all_sizes else 12
 
-            if p_max_size > base_size + 4:
+            # Apply semantic styles based on size relative to the most common font size
+            if p_max_size >= base_size * 1.5:
+                p.style = 'Title'
+            elif p_max_size >= base_size + 4:
                 p.style = 'Heading 1'
-            elif p_max_size > base_size + 1:
+            elif p_max_size >= base_size + 2:
                 p.style = 'Heading 2'
-            elif is_mostly_bold:
+            elif is_mostly_bold and p_max_size >= base_size:
                 p.style = 'Heading 3'
             
             for line in el['lines']:
