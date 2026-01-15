@@ -177,31 +177,44 @@ def get_link_target(bbox, links):
 
 def analyze_columns_simple(spans, page_width):
     """
-    Greedy clustering of left x-coordinates to detect logical column centers.
-    Returns a list of column center x-coordinates (in PDF points).
-    Uses a distance threshold relative to page width (10%) with a small absolute floor.
+    Improved greedy clustering of element centers + width-awareness.
+
+    - Uses bbox centers (x_c) and element widths to cluster.
+    - Threshold scales with page width and element width (adaptive).
+    - Returns column center x-coordinates.
     """
     if not spans:
         return [page_width / 2.0]
 
-    x_vals = sorted([s['bbox'][0] for s in spans if s.get('bbox')])
-    dist_thresh = max(page_width * 0.10, 24)  # 10% of page or 24pt floor
+    elems = []
+    for s in spans:
+        bbox = s.get('bbox') or (0, 0, 0, 0)
+        x0, _, x1, _ = bbox
+        center = (x0 + x1) / 2.0
+        width = max(1.0, x1 - x0)
+        elems.append((center, width))
+
+    # sort by center
+    elems.sort(key=lambda e: e[0])
+
     columns = []
-    current_cluster = [x_vals[0]]
+    current = [elems[0][0]]
+    # adaptive threshold: smaller for narrow pages, larger for wide
+    base_thresh = max(page_width * 0.08, 24)  # 8% of page or 24pt floor
 
-    for xv in x_vals[1:]:
-        if xv - current_cluster[-1] <= dist_thresh:
-            current_cluster.append(xv)
+    for center, width in elems[1:]:
+        # use width to loosen threshold for wide elements (so they don't split columns)
+        adaptive = max(base_thresh, width * 0.6)
+        if abs(center - current[-1]) <= adaptive:
+            current.append(center)
         else:
-            columns.append(sum(current_cluster) / len(current_cluster))
-            current_cluster = [xv]
-    if current_cluster:
-        columns.append(sum(current_cluster) / len(current_cluster))
+            columns.append(sum(current) / len(current))
+            current = [center]
+    if current:
+        columns.append(sum(current) / len(current))
 
-    # If clustering collapsed to a single column, return center of page for robustness
-    if len(columns) == 1:
-        return columns
-    return columns
+    # if we collapsed into a single column, return that center (no forced center override)
+    return columns if len(columns) > 1 else columns
 
 def extract_page_content(page):
     elements = []
@@ -347,23 +360,29 @@ def extract_page_content(page):
     columns = analyze_columns_simple(spans_for_columns, page.rect.width)
 
     # assign each element to the nearest column center, then sort by (col, y, x)
-    def get_column_index(x0):
-        if not columns:
-            return 0
-        best_idx = 0
-        best_dist = abs(x0 - columns[0])
+    def get_column_index_for_bbox(bbox, columns):
+        # assign based on bbox center; if element is very wide and overlaps two columns,
+        # choose the column whose center lies inside the bbox, else nearest center.
+        x0, _, x1, _ = bbox
+        center = (x0 + x1) / 2.0
+        # prefer columns inside bbox range
+        for idx, c in enumerate(columns):
+            # if c lies inside the element bbox, assign to that column
+            if x0 <= c <= x1:
+                return idx
+        # fallback: nearest column center
+        best_idx, best_d = 0, abs(center - columns[0])
         for idx, c in enumerate(columns[1:], start=1):
-            d = abs(x0 - c)
-            if d < best_dist:
-                best_dist = d
-                best_idx = idx
+            d = abs(center - c)
+            if d < best_d:
+                best_idx, best_d = idx, d
         return best_idx
 
     def get_reading_order(el):
         bx0, by0, bx1, by1 = el['bbox']
         height = max(0.0, by1 - by0)
-        col_idx = get_column_index(bx0)
-        # within a column, sort top-to-bottom (use by0), prefer taller blocks earlier for tie-breaks,
+        col_idx = get_column_index_for_bbox(el['bbox'], columns)
+        # within a column: sort top-to-bottom (use by0), prefer taller blocks earlier for tie-breaks,
         # then left-to-right.
         return (col_idx, float(by0), -float(height), float(bx0))
 
@@ -371,26 +390,40 @@ def extract_page_content(page):
     # Approx: if a text block's top is within ~18pt below an image bottom and its width is
     # similar to the image, consider it a caption.
     new_elements = list(elements)  # shallow copy for mutation
+
     image_elements = [el for el in elements if el['type'] == 'image']
+    consumed_text_ids = set()
     for img in image_elements:
         ix0, iy0, ix1, iy1 = img['bbox']
         img_mid_x = (ix0 + ix1) / 2.0
-        img_w = ix1 - ix0
-        for txt in elements:
-            if txt is img or txt.get('type') != 'text':
+        img_w = max(1.0, ix1 - ix0)
+        img_h = max(1.0, iy1 - iy0)
+
+        # adaptive thresholds
+        max_vdist = max(18.0, img_h * 0.35)   # up to 35% of image height
+        max_h_center = max(12.0, img_w * 0.4) # allow a bit more horizontal variance
+
+        for idx, txt in enumerate(elements):
+            # skip if it's the image itself or not text or already consumed
+            if txt is img or txt.get('type') != 'text' or id(txt) in consumed_text_ids:
                 continue
             tx0, ty0, tx1, ty1 = txt['bbox']
-            # top of text just below image bottom (within 3-20pt)
             vdist = ty0 - iy1
-            # roughly centered and width similar (caption often narrower)
             h_center_diff = abs(((tx0 + tx1) / 2.0) - img_mid_x)
-            if 0 <= vdist <= 20 and h_center_diff <= max(12, img_w * 0.2):
-                # attach as caption
+
+            # require shortish caption and modest font size
+            cap_text = "".join([s['text'] for l in txt.get('lines', []) for s in l.get('spans', [])]).strip()
+            if not cap_text or len(cap_text) > img_w * 0.8:  # very long text unlikely to be caption
+                continue
+
+            if 0 <= vdist <= max_vdist and h_center_diff <= max_h_center:
                 img.setdefault('captions', []).append(txt)
-                if txt in new_elements:
-                    new_elements.remove(txt)
+                consumed_text_ids.add(id(txt))
+                # don't remove from elements here; we will filter consumed ids once (below)
                 break
-    elements = new_elements
+
+    # finally remove consumed text blocks from elements (single pass)
+    elements = [el for el in elements if not (el.get('type') == 'text' and id(el) in consumed_text_ids)]
     
     elements.sort(key=get_reading_order)
     
@@ -435,14 +468,19 @@ def write_to_docx(doc, elements, page_width, page_height):
     for el in elements:
         
         if el['type'] == 'table':
-            data = el['data']
-            if not data or not data[0]: continue
-            
+            data = el.get('data') or []
+            if not data:
+                continue
+
+            # normalize ragged rows
             rows = len(data)
-            cols = len(data[0])
+            cols = max((len(r) for r in data), default=0)
+            cols = max(1, cols)
+
             table = doc.add_table(rows=rows, cols=cols)
             table.style = 'Table Grid'
-            # Better: prevent autofit then set explicit widths
+
+            # disable autofit robustly
             try:
                 table.allow_autofit = False
             except Exception:
@@ -453,12 +491,13 @@ def write_to_docx(doc, elements, page_width, page_height):
 
             total_pts = max(1.0, el['bbox'][2] - el['bbox'][0])
             total_in = total_pts / 72.0
-            col_width_in = total_in / max(1, cols)
+            col_width_in = total_in / float(cols)
 
-            # Apply width to each column's cells via tcPr/w attributes for more reliable layout
+            # set cell widths via tcPr (keeps prior approach)
             for r_idx in range(rows):
                 row_cells = table.rows[r_idx].cells
-                for c_idx, cell in enumerate(row_cells):
+                for c_idx in range(cols):
+                    cell = row_cells[c_idx]
                     tc = cell._tc
                     tcPr = tc.get_or_add_tcPr()
                     tcW = OxmlElement('w:tcW')
@@ -466,23 +505,24 @@ def write_to_docx(doc, elements, page_width, page_height):
                     tcW.set(_qn('w:type'), 'dxa')
                     tcPr.append(tcW)
 
+            # fill cells, padding short rows with ""
             for r, row_data in enumerate(data):
                 row_cells = table.rows[r].cells
-                for c, cell_text in enumerate(row_data):
-                    if c >= len(row_cells): break
+                # ensure row_data is list-like
+                row_list = list(row_data) if row_data else []
+                for c in range(cols):
+                    text_val = (row_list[c] if c < len(row_list) else "") or ""
                     cell = row_cells[c]
-                    t_val = (cell_text or "").strip()
-                    
                     p = cell.paragraphs[0]
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER if r == 0 else WD_ALIGN_PARAGRAPH.LEFT
-                    run = p.add_run(t_val)
-                    if r == 0:  # header row
+                    run = p.add_run(text_val.strip())
+                    if r == 0:
                         run.bold = True
-                        # Apply light shading to header cell via tcPr/shd
+                        # header shading:
                         tc = cell._tc
                         tcPr = tc.get_or_add_tcPr()
                         shd = OxmlElement('w:shd')
-                        shd.set(qn('w:fill'), 'EDEDED')  # hex without '#'
+                        shd.set(qn('w:fill'), 'EDEDED')
                         tcPr.append(shd)
                         
             doc.add_paragraph() # spacer
@@ -584,32 +624,30 @@ def write_to_docx(doc, elements, page_width, page_height):
 
             bullet_re = r'^([\u2022\u2023\u25E6\u2043\u27A2\-\*])\s+'
             numbered_re = r'^(\d+(\.\d+)*|[A-Za-z]\.)\s+'
-
             level = int(relative_indent // 18)
 
-            # If list token exists, remove it from the first span's text so Word doesn't
-            # render both the literal token and the automatic list glyph.
             is_list = False
-            if re.match(bullet_re, full_text):
-                p.style = 'List Bullet'
-                pf.left_indent = Pt(level * 18)
-                is_list = True
-            elif re.match(numbered_re, full_text):
-                p.style = 'List Number'
-                pf.left_indent = Pt(level * 18)
-                is_list = True
-            else:
-                pf.left_indent = Pt(relative_indent)
+            found_bullet = re.match(bullet_re, full_text)
+            found_number = re.match(numbered_re, full_text)
 
-            if is_list:
-                # remove token only from the very first text run (preserving other runs)
-                try:
-                    first_line = el['lines'][0]
-                    first_span = first_line['spans'][0]
-                    first_span['text'] = re.sub(bullet_re, '', first_span['text'], count=1)
-                    first_span['text'] = re.sub(numbered_re, '', first_span['text'], count=1)
-                except Exception:
-                    pass
+            if found_bullet or found_number:
+                is_list = True
+                target_style = 'List Bullet' if found_bullet else 'List Number'
+                if target_style in (s.name for s in doc.styles):
+                    try:
+                        p.style = target_style
+                        pf.left_indent = Pt(level * 18)
+                    except Exception:
+                        pf.left_indent = Pt(level * 18)
+                else:
+                    # Emulate list: set hanging indent and insert a bullet glyph run
+                    pf.left_indent = Pt(12 + level * 12)
+                    pf.first_line_indent = Pt(-12)
+                    # Insert bullet glyph as first run instead of mutating el structure
+                    glyph = found_bullet.group(1) if found_bullet else (found_number.group(1) + '.')
+                    run = p.add_run(glyph + ' ')
+                    run.bold = False
+                    # After adding glyph, continue to add actual spans below (we will not mutates spans here)
 
             # For nested lists, optionally set hanging indent for readability
             if p.style.name in ('List Bullet', 'List Number'):
@@ -634,21 +672,34 @@ def write_to_docx(doc, elements, page_width, page_height):
                     if s > p_max_size: p_max_size = s
             
             # Enhanced: Use size + bold flags for semantic hierarchy
-            is_mostly_bold = any(bool(s.get('flags', 0) & 16) for l in el['lines'] for s in l['spans'])
-            
-            # Calculate base size from all text elements to find "Normal"
-            all_sizes = [s.get('size', 12) for el in elements if el['type'] == 'text' for ln in el['lines'] for s in ln['spans']]
-            base_size = max(all_sizes, key=all_sizes.count) if all_sizes else 12
+            # Use the document-level base size (computed once above) for stable comparisons.
+            doc_base_size = base_size  # already computed earlier in write_to_docx
 
-            # Apply semantic styles based on size relative to the most common font size
-            if p_max_size >= base_size * 1.5:
-                p.style = 'Title'
-            elif p_max_size >= base_size + 4:
-                p.style = 'Heading 1'
-            elif p_max_size >= base_size + 2:
-                p.style = 'Heading 2'
-            elif is_mostly_bold and p_max_size >= base_size:
-                p.style = 'Heading 3'
+            is_mostly_bold = any(bool(s.get('flags', 0) & 16) for l in el['lines'] for s in l['spans'])
+            scale = (p_max_size / float(doc_base_size)) if doc_base_size else 1.0
+
+            # Prefer Title, H1, H2, H3 using relative scale thresholds.
+            heading_style = None
+            if scale >= 1.8:
+                heading_style = 'Title' if 'Title' in (s.name for s in doc.styles) else 'Heading 1'
+            elif scale >= 1.35:
+                heading_style = 'Heading 1' if 'Heading 1' in (s.name for s in doc.styles) else None
+            elif scale >= 1.15:
+                heading_style = 'Heading 2' if 'Heading 2' in (s.name for s in doc.styles) else None
+            elif is_mostly_bold and scale >= 1.0:
+                heading_style = 'Heading 3' if 'Heading 3' in (s.name for s in doc.styles) else None
+
+            if heading_style:
+                try:
+                    p.style = heading_style
+                    # Keep heading spacing clearer
+                    pf.space_before = Pt(10)
+                    pf.space_after = Pt(6)
+                    p.paragraph_format.keep_with_next = True
+                except Exception:
+                    # fallback: no style change, but add stronger spacing
+                    pf.space_before = Pt(10)
+                    pf.space_after = Pt(6)
             
             for line in el['lines']:
                 spans = line['spans']
