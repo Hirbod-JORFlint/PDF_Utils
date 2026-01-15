@@ -121,6 +121,7 @@ def add_hyperlink(paragraph, url, text, color, is_bold, is_italic, font_name, fo
     
     # Text
     text_el = OxmlElement('w:t')
+    text_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
     text_el.text = text
     
     run.append(rPr)
@@ -282,36 +283,42 @@ def extract_page_content(page):
                 })
 
     # Detect logical columns based on the distribution of x0 coordinates
-    x_coords = sorted([el['bbox'][0] for el in elements])
-    columns = [0]
-    # Detect logical columns based on the distribution of x0 coordinates
-    # Filter out very small overlaps and group x-coordinates into clusters
-    if x_coords:
-        # Use a 10% page width threshold to identify distinct column starts
-        col_threshold = page.rect.width * 0.10
-        for i in range(1, len(x_coords)):
-            if x_coords[i] - columns[-1] > col_threshold:
-                columns.append(x_coords[i])                           
-    # Sort elements primarily by column (x-coordinate), then by row (y-coordinate)
-    # This ensures that in multi-column layouts, the left column is read fully before the right.
+    # Cluster the left x-coordinate (bbox[0]) into logical columns using a greedy
+    # distance-based clustering. This is more robust across small offsets.
+    x_vals = sorted([el['bbox'][0] for el in elements])
+    columns = []
+    if x_vals:
+        # distance threshold uses a fraction of page width (10%) but also a small absolute min
+        dist_thresh = max(page.rect.width * 0.10, 24)  # 24pt floor
+        current_cluster = [x_vals[0]]
+        for xv in x_vals[1:]:
+            if xv - current_cluster[-1] <= dist_thresh:
+                current_cluster.append(xv)
+            else:
+                columns.append(sum(current_cluster) / len(current_cluster))
+                current_cluster = [xv]
+        if current_cluster:
+            columns.append(sum(current_cluster) / len(current_cluster))
+
+    # assign each element to the nearest column center, then sort by (col, y, x)
+    def get_column_index(x0):
+        if not columns:
+            return 0
+        best_idx = 0
+        best_dist = abs(x0 - columns[0])
+        for idx, c in enumerate(columns[1:], start=1):
+            d = abs(x0 - c)
+            if d < best_dist:
+                best_dist = d
+                best_idx = idx
+        return best_idx
+
     def get_reading_order(el):
-        bbox = el['bbox']
-        # Snap x-coordinate to the nearest column start to handle slight misalignments
-        col_idx = 0
-        for idx, col_start in enumerate(columns):
-            if bbox[0] >= col_start - 5: # 5pt tolerance
-                col_idx = idx
-        # Sort by Column first, then Y (top-to-bottom), then X (left-to-right)
-        return (col_idx, round(bbox[1], 1), round(bbox[0], 1))
-    
-    # New Logic:
-    # 1. 'elements' currently contains tables and images (processed first).
-    # 2. Add processed text paragraphs to 'elements'.
-    # 3. Sort primarily by vertical position, BUT with a column-aware grouping 
-    #    or simply trust the "sort=True" block order if you remove the manual sort.
-    
-    # Robust Fix: Sort by vertical bands to keep columns distinct
-    # (Groups items within 50px vertical distinctness, then sorts Left-to-Right)
+        bx0, by0, bx1, by1 = el['bbox']
+        col_idx = get_column_index(bx0)
+        # within a column, sort top-to-bottom, then left-to-right for ties
+        return (col_idx, round(by0, 1), round(bx0, 1))
+
     elements.sort(key=get_reading_order)
     
     return elements
@@ -354,6 +361,15 @@ def write_to_docx(doc, elements, page_width, page_height):
             for column in table.columns:
                 column.width = col_width
             
+
+            # set column widths (proportional to table bbox)
+            total_pts = el['bbox'][2] - el['bbox'][0]
+            # compute width in inches once
+            total_in = (total_pts / 72.0) if total_pts > 0 else (page_width / 72.0)
+            col_width_in = total_in / cols
+            for ci, column in enumerate(table.columns):
+                column.width = Inches(col_width_in)
+
             for r, row_data in enumerate(data):
                 row_cells = table.rows[r].cells
                 for c, cell_text in enumerate(row_data):
@@ -361,14 +377,18 @@ def write_to_docx(doc, elements, page_width, page_height):
                     cell = row_cells[c]
                     t_val = (cell_text or "").strip()
                     
-                    # Create a run to allow formatting
                     p = cell.paragraphs[0]
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER if r == 0 else WD_ALIGN_PARAGRAPH.LEFT
                     run = p.add_run(t_val)
-                    if r == 0: # Bold headers
+                    if r == 0:  # header row
                         run.bold = True
-                        cell.shading.background_pattern_color = "EDEDED"
-            
+                        # Apply light shading to header cell via tcPr/shd
+                        tc = cell._tc
+                        tcPr = tc.get_or_add_tcPr()
+                        shd = OxmlElement('w:shd')
+                        shd.set(qn('w:fill'), 'EDEDED')  # hex without '#'
+                        tcPr.append(shd)
+                        
             doc.add_paragraph() # spacer
 
         elif el['type'] == 'image':
@@ -401,16 +421,29 @@ def write_to_docx(doc, elements, page_width, page_height):
             
             # Get full text to check for list patterns
             full_text = "".join([s['text'] for l in el['lines'] for s in l['spans']]).strip()
+            pf = p.paragraph_format
 
-            # Expanded regex for nested numbers (1.1) and varied bullet glyphs
-            if re.match(r'^([\u2022\u2023\u25E6\u2043\u27A2\-\*])\s+', full_text):
+            # Detect bullet/number start tokens
+            bullet_re = r'^([\u2022\u2023\u25E6\u2043\u27A2\-\*])\s+'
+            numbered_re = r'^(\d+(\.\d+)*|[A-Za-z]\.)\s+'
+
+            if re.match(bullet_re, full_text):
                 p.style = 'List Bullet'
-                pf.left_indent = Pt(0) # Let Word style handle the bullet indent
-            elif re.match(r'^(\d+(\.\d+)*|[A-Za-z]\.)\s+', full_text):
+                pf.left_indent = Pt(0)
+            elif re.match(numbered_re, full_text):
                 p.style = 'List Number'
                 pf.left_indent = Pt(0)
-    
-            pf = p.paragraph_format
+
+            # Nested lists: apply additional left_indent proportional to relative_indent
+            # relative_indent earlier computed as max(0, raw_indent - margin_buffer)
+            try:
+                if 'relative_indent' in locals():
+                    # compute level (integer) by dividing indent by typical tab width (18pt)
+                    level = int(max(0, relative_indent) // 18)
+                    pf.left_indent = Pt(level * 18)
+            except Exception:
+                pass
+            
             # Indentation
             raw_indent = el['indent_pt']
             relative_indent = max(0, raw_indent - margin_buffer)
